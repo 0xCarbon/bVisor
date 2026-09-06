@@ -1602,6 +1602,9 @@ func (s *Sandbox) destroy() error {
 // true and signal is SIGKILL, then waits for all processes to exit before
 // returning.
 func (s *Sandbox) SignalContainer(cid string, sig unix.Signal, all bool) error {
+	if sig < 0 || sig > linux.SignalMaximum {
+		return fmt.Errorf("invalid signal %d: %w", sig, unix.EINVAL)
+	}
 	log.Debugf("Signal sandbox %q", s.ID)
 	mode := boot.DeliverToProcess
 	if all {
@@ -1624,6 +1627,9 @@ func (s *Sandbox) SignalContainer(cid string, sig unix.Signal, all bool) error {
 // in the same session that PID belongs to. This is only valid if the process
 // is attached to a host TTY.
 func (s *Sandbox) SignalProcess(cid string, pid int32, sig unix.Signal, fgProcess bool) error {
+	if sig < 0 || sig > linux.SignalMaximum {
+		return fmt.Errorf("invalid signal %d: %w", sig, unix.EINVAL)
+	}
 	log.Debugf("Signal sandbox %q", s.ID)
 
 	mode := boot.DeliverToProcess
@@ -1646,6 +1652,9 @@ func (s *Sandbox) SignalProcess(cid string, pid int32, sig unix.Signal, fgProces
 // SignalProcessGroup sends the signal to all processes in the process group
 // identified by pgid. pgid is relative to the root PID namespace.
 func (s *Sandbox) SignalProcessGroup(cid string, pgid int32, sig unix.Signal) error {
+	if sig < 0 || sig > linux.SignalMaximum {
+		return fmt.Errorf("invalid signal %d: %w", sig, unix.EINVAL)
+	}
 	log.Debugf("Signal sandbox %q process group %d", s.ID, pgid)
 
 	args := boot.SignalArgs{

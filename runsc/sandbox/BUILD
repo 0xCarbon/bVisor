@@ -76,6 +76,7 @@ go_test(
         "checkpoint_errors_test.go",
         "network_test.go",
         "sandbox_zombie_test.go",
+        "signal_test.go",
     ],
     library = ":sandbox",
     deps = [

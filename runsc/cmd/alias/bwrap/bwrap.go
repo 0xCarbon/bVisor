@@ -50,8 +50,8 @@ type bwrapConfig struct {
 	runscConfig *config.Config
 	Env         []string
 	UnsetEnv    []string
-	UID         int
-	GID         int
+	UID         int64
+	GID         int64
 	UnshareUser bool
 	Hostname    string
 	ShareNet    bool
@@ -177,26 +177,26 @@ func (c *bwrapConfig) mapCWD() (string, error) {
 // --unshare-user, --uid and --gid.
 func (c *bwrapConfig) userNamespace() []sandbox.Option {
 	hostUID := os.Getuid()
-	targetUID := hostUID
+	targetUID := int64(hostUID)
 	if c.UID != -1 {
 		targetUID = c.UID
 	}
 	hostGID := os.Getgid()
-	targetGID := hostGID
+	targetGID := int64(hostGID)
 	if c.GID != -1 {
 		targetGID = c.GID
 	}
 
 	// When running under sudo (e.g. in CI tests), SUDO_UID/SUDO_GID point to the true non-root workspace owner.
 	// When running without sudo, they gracefully fallback to the current host UID/GID.
-	sudoUID := getEnvInt("SUDO_UID", hostUID)
-	sudoGID := getEnvInt("SUDO_GID", hostGID)
+	sudoUID := getEnvUint32("SUDO_UID", uint32(hostUID))
+	sudoGID := getEnvUint32("SUDO_GID", uint32(hostGID))
 
 	uidMappings := []specs.LinuxIDMapping{
-		{ContainerID: uint32(targetUID), HostID: uint32(sudoUID), Size: 1},
+		{ContainerID: uint32(targetUID), HostID: sudoUID, Size: 1},
 	}
 	gidMappings := []specs.LinuxIDMapping{
-		{ContainerID: uint32(targetGID), HostID: uint32(sudoGID), Size: 1},
+		{ContainerID: uint32(targetGID), HostID: sudoGID, Size: 1},
 	}
 
 	// When runsc is executed by root (hostUID == 0), gVisor's Gofer initialization requires Container 0:0
@@ -310,11 +310,12 @@ func do(ctx context.Context, c *bwrapConfig, waitStatus *unix.WaitStatus) subcom
 	return subcommands.ExitSuccess
 }
 
-// getEnvInt parses an environment variable as an integer, returning fallback if empty or invalid.
-func getEnvInt(key string, fallback int) int {
+// getEnvUint32 parses an environment variable as a user or group ID, returning
+// fallback if empty, negative, out of range, or otherwise invalid.
+func getEnvUint32(key string, fallback uint32) uint32 {
 	if s := os.Getenv(key); s != "" {
-		if v, err := strconv.Atoi(s); err == nil {
-			return v
+		if v, err := strconv.ParseUint(s, 10, 32); err == nil {
+			return uint32(v)
 		}
 	}
 	return fallback

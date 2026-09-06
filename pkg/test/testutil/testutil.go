@@ -81,12 +81,12 @@ func IntFromEnv(name string, def int) int {
 	if str == "" {
 		return def
 	}
-	v, err := strconv.ParseInt(str, 10, 64)
+	v, err := strconv.Atoi(str)
 	if err != nil {
 		// N.B. This library is testonly, so a panic here is reasonable.
 		panic(fmt.Errorf("invalid environment variable %q; got %q expected integer: %w", name, str, err))
 	}
-	return int(v)
+	return v
 }
 
 // BoolFromEnv returns the boolean value of the named environment variable, or `def` if unset/empty.

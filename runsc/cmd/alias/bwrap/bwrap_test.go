@@ -34,6 +34,64 @@ const (
 	sudoGID = 4343
 )
 
+func TestSudoIDBounds(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  uint32
+	}{
+		{"", 1234},
+		{"not-an-id", 1234},
+		{"-1", 1234},
+		{"4294967296", 1234},
+		{"4294967297", 1234},
+		{"0", 0},
+		{"4294967295", 4294967295},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			for _, key := range []string{"SUDO_UID", "SUDO_GID"} {
+				t.Setenv(key, tc.value)
+				if got := getEnvUint32(key, 1234); got != tc.want {
+					t.Errorf("%s=%q: got %d, want %d", key, tc.value, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestParseIDBounds(t *testing.T) {
+	for _, flag := range []string{"--uid", "--gid"} {
+		for _, tc := range []struct {
+			value string
+			want  int64
+		}{
+			{"0", 0},
+			{"4294967295", 4294967295},
+			{"-1", -1},
+			{"4294967296", -1},
+		} {
+			t.Run(flag+"/"+tc.value, func(t *testing.T) {
+				cfg, err := parseBwrapArgs([]string{"--unshare-user", flag, tc.value, "true"})
+				if tc.want == -1 {
+					if err == nil {
+						t.Fatal("out-of-range ID accepted")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := cfg.UID
+				if flag == "--gid" {
+					got = cfg.GID
+				}
+				if got != tc.want {
+					t.Errorf("ID = %d, want %d", got, tc.want)
+				}
+			})
+		}
+	}
+}
+
 // wantIDMappings returns the mappings bwrap is expected to build for an
 // unshared user namespace that runs as containerID.
 func wantIDMappings(containerID, hostID uint32) []specs.LinuxIDMapping {

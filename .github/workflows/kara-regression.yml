@@ -77,6 +77,7 @@ jobs:
             //pkg/lisafs:fuzz_test \
             //pkg/tcpip/tests/integration:egress_gate_test \
             //runsc/boot:egress_gate_test \
+            //runsc/cmd/alias/bwrap:bwrap_test \
             //runsc/compat:compat_test \
             //runsc/fsgofer:lisafs_test \
             //runsc/sandbox:sandbox_test

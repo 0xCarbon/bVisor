@@ -325,7 +325,7 @@ func (c *bwrapConfig) parseUID(args []string, i int) (int, error) {
 	if err != nil {
 		return i, fmt.Errorf("bwrap: Invalid uid %v: %v", args[i+1], err)
 	}
-	c.UID = int(uid)
+	c.UID = int64(uid)
 
 	return i + 2, nil
 }
@@ -338,7 +338,7 @@ func (c *bwrapConfig) parseGID(args []string, i int) (int, error) {
 	if err != nil {
 		return i, fmt.Errorf("bwrap: Invalid gid %v: %v", args[i+1], err)
 	}
-	c.GID = int(gid)
+	c.GID = int64(gid)
 
 	return i + 2, nil
 }
