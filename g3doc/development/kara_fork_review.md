@@ -31,12 +31,6 @@ a narrow test does not establish that the remaining areas are complete.
 These are review leads, not claims that every suspected problem has been
 reproduced. Each correction will record its regression evidence below.
 
-- TCP prefix capture flattens the entire queued payload before applying the
-  32 KiB classification limit.
-- Adding an egress gate while restoring an ungated checkpoint does not persist
-  the enforcement requirement. A subsequent restore without a gate can run
-  ungated. Bare netstack restores also leave previously gated stacks without a
-  rejecting gate when no replacement is supplied.
 - `Runtime.ExePath` temporarily changes a global executable path; sidecar lookup
   caches the first installation globally. Concurrent and sequential runtimes
   need independent launcher selection.
@@ -65,3 +59,37 @@ protocol remains version 1, checked against Oca's `network/gate.go`.
 
 Full release and consumer validation remain pending until the broader changes
 are ready.
+
+### Egress enforcement after restore
+
+Adding a gate while restoring an ungated checkpoint now persists the requirement
+in both the stack and its namespace creator. A second restore without a gate
+cannot drop enforcement or create ungated namespaces. A stack restored without
+its required gate installs a denying implementation, so callers outside runsc
+also fail closed.
+
+Actual `state.Save`/`state.Load` regressions reproduce the original lost marker
+and absent gate. The corrected cases pass in
+`//pkg/tcpip/tests/integration:egress_gate_test` and
+`//runsc/boot:egress_gate_test`, including a second save/restore of the namespace
+creator after enforcement was added.
+
+### Bounded TCP prefix capture
+
+Prefix capture now copies a capped packet range without flattening the entire
+send queue payload. The original payload is retained for normal TCP delivery.
+`//pkg/tcpip/transport/tcp:tcp_test` verifies capture across multiple writes and
+that queue data is unchanged.
+
+On the same Linux amd64 host, `BenchmarkEgressL7Prefix` with 200 ms per case
+reported the following allocation sizes. These are local measurements, not
+cross-machine performance guarantees.
+
+| Queued payload | Before, bytes/op | After, bytes/op |
+| --- | ---: | ---: |
+| 32 KiB | 65,606 | 32,798 |
+| 1 MiB | 1,085,925 | 32,802 |
+| 4 MiB | 4,243,054 | 32,783 |
+
+All three affected test targets pass together. Race, release and consumer
+validation are tracked separately from these unit and stack integration tests.

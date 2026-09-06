@@ -16,6 +16,7 @@ package boot
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -24,7 +25,9 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 // faultGateConn provides replies even after transport errors. A fail-closed
@@ -36,6 +39,35 @@ type faultGateConn struct {
 	shortWrite  bool
 	closed      bool
 	writes      int
+}
+
+func TestEgressGateCreatorRetainsRestoredEnforcement(t *testing.T) {
+	roundTrip := func(c *sandboxNetstackCreator, ctx context.Context) *sandboxNetstackCreator {
+		t.Helper()
+		var image bytes.Buffer
+		if _, err := state.Save(context.Background(), &image, c); err != nil {
+			t.Fatalf("saving creator: %v", err)
+		}
+		restored := &sandboxNetstackCreator{}
+		if _, err := state.Load(ctx, &image, restored); err != nil {
+			t.Fatalf("loading creator: %v", err)
+		}
+		return restored
+	}
+	// The initial checkpoint has no gate; its first restore adds one.
+	gate := &egressGateClient{}
+	ctx := context.WithValue(context.Background(), stack.CtxEgressGate{}, gate)
+	first := roundTrip(&sandboxNetstackCreator{}, ctx)
+	if first.egressGate != gate {
+		t.Fatal("creator did not adopt the restored gate")
+	}
+	second := roundTrip(first, context.Background())
+	if !second.egressGateMissing {
+		t.Fatal("second restore forgot that newly created namespaces require a gate")
+	}
+	if _, err := second.CreateStack(); err == nil {
+		t.Fatal("restored creator allowed an ungated namespace")
+	}
 }
 
 func TestEgressGateQueueDeadline(t *testing.T) {

@@ -2032,6 +2032,9 @@ func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, userns *aut
 		}
 		s, err := creator.newEmptySandboxNetworkStack()
 		if err != nil {
+			if creator.egressGate != nil {
+				creator.egressGate.Close()
+			}
 			return nil, nil, err
 		}
 		return inet.NewRootNamespace(s, creator, userns), creator, nil
@@ -2063,6 +2066,7 @@ func (c *sandboxNetstackCreator) newEmptySandboxNetworkStack() (*netstack.Stack,
 			return nil, fmt.Errorf("oca egress gate: %w", err)
 		}
 		c.egressGate = gateClient
+		c.egressGated = true
 	}
 	var egressGate stack.EgressGate
 	if c.egressGate != nil {
@@ -2126,6 +2130,9 @@ type sandboxNetstackCreator struct {
 	allowLiveTCPMigration    bool
 	uid                      uniqueid.Provider
 	egressFD                 *int // Oca #447: nil when disabled
+	// egressGated persists enforcement added at restore, even when the
+	// original creator had no donated egressFD.
+	egressGated bool
 
 	// egressGate is the single live gate client shared by every stack this
 	// creator builds. The donated FD is consumed exactly once (dup + close
@@ -2142,7 +2149,9 @@ type sandboxNetstackCreator struct {
 
 // afterLoad is invoked by stateify.
 func (c *sandboxNetstackCreator) afterLoad(ctx stdcontext.Context) {
+	c.egressGated = c.egressGated || c.egressFD != nil
 	if c.egressGate != nil {
+		c.egressGated = true
 		return
 	}
 	if g, ok := ctx.Value(stack.CtxEgressGate{}).(*egressGateClient); ok && g != nil {
@@ -2150,9 +2159,10 @@ func (c *sandboxNetstackCreator) afterLoad(ctx stdcontext.Context) {
 		// restore time; this covers the root namespace and every network
 		// namespace restored from the checkpoint.
 		c.egressGate = g
+		c.egressGated = true
 		return
 	}
-	if c.egressFD != nil {
+	if c.egressGated {
 		// The checkpoint was taken with egress enforcement; restoring it
 		// without --egress-fd must not silently drop enforcement.
 		c.egressGateMissing = true

@@ -214,6 +214,7 @@ go_test(
     ],
     library = ":boot",
     deps = [
+        "//pkg/state",
         "//pkg/tcpip",
         "//pkg/tcpip/stack",
         "//runsc/config",
