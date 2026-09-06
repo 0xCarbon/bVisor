@@ -110,8 +110,8 @@ type Boot struct {
 	// egress data path is disabled (Oca #447).
 	egressFD int
 
-	// ingressFD is the AF_UNIX FD to the Oca host-ingress relay, or -1 when
-	// the ingress data path is disabled (Oca #541).
+	// ingressFD is the AF_UNIX FD to the host-ingress relay, or -1 when
+	// the ingress data path is disabled.
 	ingressFD int
 
 	// devIoFD is the FD to connect to dev gofer.
@@ -297,7 +297,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&b.pinRingFD, "pin-ring-fd", -1, "FD of a disabled io_uring in which the sentry pins its expensive-to-release files")
 	f.Var(&b.ioFDs, "io-fds", "list of image FDs and/or socket FDs to connect gofer clients. They must follow this order: root first, then mounts as defined in the spec")
 	f.IntVar(&b.egressFD, "egress-fd", -1, "AF_UNIX FD to the Oca egress flow gate (Oca #447); -1 disables egress enforcement")
-	f.IntVar(&b.ingressFD, "ingress-fd", -1, "AF_UNIX FD to the Oca host-ingress relay (Oca #541); -1 disables host ingress")
+	f.IntVar(&b.ingressFD, "ingress-fd", -1, "AF_UNIX FD to the host-ingress relay; -1 disables host ingress")
 	f.IntVar(&b.devIoFD, "dev-io-fd", -1, "FD to connect dev gofer client")
 	f.Var(&b.stdioFDs, "stdio-fds", "list of FDs containing sandbox stdin, stdout, and stderr in that order")
 	f.Var(&b.passFDs, "pass-fd", "mapping of host to guest FDs. They must be in M:N format. M is the host and N the guest descriptor.")

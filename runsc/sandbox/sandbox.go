@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -278,8 +279,8 @@ type Args struct {
 	// the sandbox as --egress-fd (Oca #447). Nil when disabled.
 	EgressFile *os.File
 
-	// IngressFile is the AF_UNIX FD to the Oca host-ingress relay, donated
-	// to the sandbox as --ingress-fd (Oca #541). Nil when disabled.
+	// IngressFile is the AF_UNIX FD to the host-ingress relay, donated
+	// to the sandbox as --ingress-fd. Nil when disabled.
 	IngressFile *os.File
 
 	// File that connects to a gofer endpoint for a device mount point at /dev.
@@ -550,6 +551,22 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 
 // Restore sends the restore call for a container in the sandbox.
 func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, direct, background bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
+	return s.RestoreWithOptions(conf, spec, cid, RestoreOptions{ImagePath: imagePath, Direct: direct, Background: background, NetworkArgs: networkArgs})
+}
+
+// RestoreOptions configures sandbox restore. IngressFile is borrowed during the
+// call and, when provided, replaces the create-time ingress socket.
+type RestoreOptions struct {
+	ImagePath   string
+	Direct      bool
+	Background  bool
+	NetworkArgs *boot.CreateLinksAndRoutesArgs
+	IngressFile *os.File
+}
+
+// RestoreWithOptions sends the restore call with optional fresh FD donations.
+func (s *Sandbox) RestoreWithOptions(conf *config.Config, spec *specs.Spec, cid string, opts RestoreOptions) error {
+	imagePath, direct, background, networkArgs := opts.ImagePath, opts.Direct, opts.Background, opts.NetworkArgs
 	if err := hostsettings.Handle(conf); err != nil {
 		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
 	}
@@ -575,6 +592,20 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 		defer deviceFile.Close()
 		opt.HaveDeviceFile = true
 		opt.FilePayload.Files = append(opt.FilePayload.Files, deviceFile.ReleaseToFile("device file"))
+	}
+
+	if opts.IngressFile != nil {
+		ingressFD := int(opts.IngressFile.Fd())
+		if err := boot.ValidateIngressFD(conf, &ingressFD); err != nil {
+			return err
+		}
+		donatedFD, err := unix.FcntlInt(opts.IngressFile.Fd(), unix.F_DUPFD_CLOEXEC, 0)
+		runtime.KeepAlive(opts.IngressFile)
+		if err != nil {
+			return fmt.Errorf("duplicating ingress file: %w", err)
+		}
+		opt.HaveIngressFile = true
+		opt.Files = append(opt.Files, os.NewFile(uintptr(donatedFD), "ingress-fd"))
 	}
 
 	conn, err := s.sandboxConnect()
@@ -1318,13 +1349,37 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		stdios[0] = os.Stdin
 		stdios[1] = os.Stdout
 		stdios[2] = os.Stderr
+		if args.IngressFile != nil {
+			// A donation may occupy descriptor zero, or duplicate another
+			// standard descriptor. Never expose the relay transport to the
+			// application as stdio: guest reads could steal protocol frames
+			// and closing a Unix stdio socket shuts down its shared transport.
+			ingressInfo, err := args.IngressFile.Stat()
+			if err != nil {
+				return fmt.Errorf("stat ingress donation: %w", err)
+			}
+			for i, stdio := range stdios {
+				info, err := stdio.Stat()
+				if err != nil {
+					return fmt.Errorf("stat stdio %d: %w", i, err)
+				}
+				if os.SameFile(ingressInfo, info) {
+					null, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+					if err != nil {
+						return fmt.Errorf("replacing donated stdio %d: %w", i, err)
+					}
+					defer null.Close()
+					stdios[i] = null
+				}
+			}
+		}
 
 		if conf.Debug {
 			// If debugging, send the boot process stdio to the
 			// this process' stdio, so that is is easier to find.
-			cmd.Stdin = os.Stdin
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
+			cmd.Stdin = stdios[0]
+			cmd.Stdout = stdios[1]
+			cmd.Stderr = stdios[2]
 		}
 	}
 	if err := s.configureStdios(conf, stdios[:]); err != nil {
