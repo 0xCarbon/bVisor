@@ -1748,11 +1748,12 @@ func (e *Endpoint) appendEgressL7Prefix(seg *segment) {
 	if remaining <= 0 {
 		return
 	}
-	payloadBuffer := seg.pkt.Data().ToBuffer()
-	defer payloadBuffer.Release()
-	payload := payloadBuffer.Flatten()
-	if len(payload) > remaining {
-		payload = payload[:remaining]
+	// Cap before copying: flattening the entire queued write allocates in
+	// proportion to the send buffer, even though classification is bounded.
+	payload := seg.pkt.Data().AsRange().Capped(remaining).ToSlice()
+	if len(e.egressL7Prefix) == 0 {
+		e.egressL7Prefix = payload
+		return
 	}
 	e.egressL7Prefix = append(e.egressL7Prefix, payload...)
 }

@@ -8,8 +8,12 @@ package(
 go_test(
     name = "egress_gate_test",
     size = "small",
-    srcs = ["egress_gate_test.go"],
+    srcs = [
+        "egress_gate_test.go",
+        "egress_restore_test.go",
+    ],
     deps = [
+        "//pkg/state",
         "//pkg/tcpip",
         "//pkg/tcpip/adapters/gonet",
         "//pkg/tcpip/header",

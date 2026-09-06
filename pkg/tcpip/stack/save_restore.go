@@ -54,7 +54,14 @@ func (s *Stack) afterLoad(ctx context.Context) {
 	// Re-attach the egress gate donated at restore time. The saved gate is
 	// nil (state:"nosave"); without this, restored stacks would silently
 	// run ungated even though restore accepted --egress-fd.
-	if g, ok := ctx.Value(CtxEgressGate{}).(EgressGate); ok {
-		s.egressGate = g
+	s.egressGate, _ = ctx.Value(CtxEgressGate{}).(EgressGate)
+	if s.egressGate != nil {
+		// A gate may be added when restoring a previously ungated stack.
+		// Preserve that requirement in every subsequent checkpoint.
+		s.egressGated = true
+	} else if s.egressGated {
+		// Enforce this at the stack boundary too: callers other than runsc
+		// must not silently turn a missing donation into an ungated stack.
+		s.egressGate = missingEgressGate{}
 	}
 }

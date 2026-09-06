@@ -75,8 +75,9 @@ type FDControl interface {
 type StreamReader interface {
 	FDControl
 	// ReadVec reads into the given buffers, returning the number of bytes
-	// read. A read returning fewer than the total buffer length is only
-	// acceptable at end-of-stream.
+	// read. A stream read may return fewer bytes than requested with a nil
+	// error. Callers must assemble complete protocol messages and collect or
+	// close received descriptors after each read, including a failed read.
 	ReadVec(dsts [][]byte) (int, error)
 }
 
@@ -85,7 +86,9 @@ type StreamReader interface {
 type StreamWriter interface {
 	FDControl
 	// WriteVec writes from the given buffers, returning the number of bytes
-	// written. A write must not persist partially unless it returns an error.
+	// written. A stream write may be partial with a nil error. Callers must
+	// advance the buffers before retrying and clear packed descriptors after
+	// a successful partial write so the retry does not donate them again.
 	WriteVec(srcs [][]byte) (int, error)
 }
 
@@ -118,16 +121,16 @@ type ControlSocket interface {
 // descriptor-donation pair, and the shared-memory packet-window allocator
 // (see pkg/flipcall/SEAM.md for the latter two).
 //
-// This is the injection point that lets pkg/lisafs and its callers be built
-// per host without knowing the backend: today they call
-// unet/fdchannel/flipcall constructors directly on Linux; a non-Linux build
-// routes through hostifc.Default() (wave-05 ships the seam; backend routing
-// of lisafs' own call sites is wave-06 material, deliberately not done here
-// to keep Linux behavior byte-identical).
+// This interface describes the backend needed by a future host port. The
+// current lisafs call sites still use unet/fdchannel/flipcall constructors
+// directly; neither Linux nor non-Linux builds route them through Default.
+// Providing another IPC implementation also requires wiring those call sites
+// and implementing the remaining host dependencies.
 type IPC interface {
 	// ControlSocketFromFD adopts an already-connected control socket
 	// descriptor, usually passed by the sandbox launcher, and returns it as
-	// a ControlSocket. The returned socket owns fd.
+	// a ControlSocket. Ownership transfers on success; on error the caller
+	// retains fd. The Linux adapter may set fd nonblocking before failing.
 	ControlSocketFromFD(fd int) (ControlSocket, error)
 
 	// NewControlSocketPair returns a pair of connected control sockets

@@ -14,18 +14,18 @@
 
 package hostifc
 
-// ControlPlane reports which Linux-only host control-plane features are
-// available on this host. These features sandbox and shape the sentry
+// ControlPlane describes host control-plane features supported by this build's
+// backend. It does not probe the running kernel or the caller's permissions.
+// These features sandbox and shape the sentry
 // process itself; a non-Linux host must replace each of them at the VM or
 // job boundary instead (see pkg/sentry/platform/platform-seam.md for the
 // per-feature mapping).
 //
-// A false field means the feature is absent AND its sentry-side packages
-// fail closed (return errors.ErrUnsupported or natural errors) rather than
-// changing behavior: e.g. seccomp.SetFilter on non-Linux hosts returns
-// ErrUnsupported, and hostmm.Probe reports no membarrier support. This lets
-// the sentry core compile and boot on non-Linux hosts with those features
-// disabled, instead of requiring sentry-wide ifdefs.
+// A false field means this backend does not implement that feature. Some
+// corresponding packages provide stubs, such as seccomp.SetFilter returning
+// errors.ErrUnsupported on non-Linux hosts. Other host dependencies still need
+// porting; disabling these features does not make the sentry boot on non-Linux
+// hosts or provide an alternative isolation boundary.
 type ControlPlane struct {
 	// SeccompFilters: installing host seccomp filters (prctl(2)
 	// PR_SET_SECCOMP + seccomp(2)). Linux: pkg/seccomp.
