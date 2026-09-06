@@ -147,8 +147,12 @@ func TestRuntimeConfigArgvFree(t *testing.T) {
 	if conf.RootDir != rootDir {
 		t.Errorf("Config().RootDir = %q, want %q", conf.RootDir, rootDir)
 	}
-	if conf.Platform != def.Platform {
-		t.Errorf("Config().Platform = %q, want default %q", conf.Platform, def.Platform)
+	wantPlatform := def.Platform
+	if *libraryPlatform != "" {
+		wantPlatform = *libraryPlatform
+	}
+	if conf.Platform != wantPlatform {
+		t.Errorf("Config().Platform = %q, want %q", conf.Platform, wantPlatform)
 	}
 	if conf.Network != config.NetworkNone {
 		t.Errorf("Config().Network = %v, want %v (Options.Network)", conf.Network, config.NetworkNone)
