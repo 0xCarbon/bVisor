@@ -373,7 +373,7 @@ func (r *restorer) restore(l *Loader) error {
 	}
 	r.timer.Reached("specs validated")
 
-	p, err := createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile, l.sandboxID, r.timer)
+	p, err := createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile, l.sandboxID, r.timer, &l.pinRing)
 	if err != nil {
 		return fmt.Errorf("creating platform: %v", err)
 	}
@@ -493,14 +493,12 @@ func (r *restorer) restore(l *Loader) error {
 		vfs.CtxRestoreFilesystemFDMap:     restoreMnts.fdmap,
 		pgalloc.CtxMemoryFileMap:          restoreMnts.mfmap,
 		devutil.CtxDevGoferClientProvider: l.k,
-		kernel.CtxFSRestore:               l.fsRestore != nil,
-		vfs.CtxFSTarProvider:              l.fsRestore,
 	})
 
 	if r.asyncMFLoader != nil {
 		// Now that private memory files are known, kick off their loading in the
 		// background goroutine.
-		r.asyncMFLoader.KickoffPrivate(ctx, restoreMnts.mfmap)
+		r.asyncMFLoader.KickoffPrivate(restoreMnts.mfmap)
 	}
 
 	ctx, err = r.prepareNvproxyRestoreContextLocked(ctx, l)
@@ -513,9 +511,10 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	// Load the state.
+	clocks := time.NewCalibratedClocks(shouldEnableClockMonotonicRaw(l.root.spec, l.root.conf))
 	r.timer.Reached("loading kernel")
 	if r.extractRootFsMode {
-		if err := l.k.ExtractRootfsUpperLayer(ctx, r.stateFile, r.asyncMFLoader, nil, time.NewCalibratedClocks(), r.rootFsOutputTar); err != nil {
+		if err := l.k.ExtractRootfsUpperLayer(ctx, r.stateFile, r.asyncMFLoader, nil, clocks, r.rootFsOutputTar); err != nil {
 			return fmt.Errorf("failed to extract rootfs upper layer: %w", err)
 		}
 		r.timer.Reached("rootfs upper layer extracted")
@@ -528,7 +527,7 @@ func (r *restorer) restore(l *Loader) error {
 	if l.egressGate != nil {
 		ctx = context.WithValue(ctx, stack.CtxEgressGate{}, stack.EgressGate(l.egressGate))
 	}
-	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader, nil, l, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}, r.timer.Fork("kernel load")); err != nil {
+	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader, nil, l, clocks, &vfs.CompleteRestoreOptions{}, r.timer.Fork("kernel load")); err != nil {
 		return fmt.Errorf("failed to load kernel: %w", err)
 	}
 	// Fail closed: a checkpoint taken with an egress gate must not come
@@ -733,10 +732,6 @@ func (l *Loader) save(o *control.SaveOpts) (err error) {
 		return err
 	}
 	defer saveOpts.Close()
-
-	if saveOpts.FSSaveOpts != nil {
-		saveOpts.FSSaveOpts.RunscVersion = version.Version()
-	}
 
 	return l.saveWithOpts(saveOpts, &o.ExecOpts)
 }

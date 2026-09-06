@@ -17,7 +17,11 @@
 
 package fdchannel
 
-import "golang.org/x/sys/unix"
+import (
+	"syscall"
+
+	"golang.org/x/sys/unix"
+)
 
 // socketpairSeqPacket returns a connected pair of AF_UNIX SOCK_SEQPACKET
 // sockets with FD_CLOEXEC set on both descriptors. Hosts without
@@ -31,8 +35,8 @@ func socketpairSeqPacket() ([2]int, error) {
 	// guarded against a concurrent fork/exec, or the child could inherit
 	// the donation sockets (syscall.ForkLock is the Go runtime's contract
 	// for exactly this pattern).
-	unix.ForkLock.Lock()
-	defer unix.ForkLock.Unlock()
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
 	if err != nil {
 		return fds, err

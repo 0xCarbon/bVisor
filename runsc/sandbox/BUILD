@@ -58,7 +58,6 @@ go_library(
         "//runsc/sandbox/bpf",
         "//runsc/specutils",
         "//runsc/starttime",
-        "//runsc/version",
         "//tools/xdp/cmd",
         "@com_github_cilium_ebpf//:go_default_library",
         "@com_github_cilium_ebpf//link:go_default_library",
@@ -77,6 +76,7 @@ go_test(
         "checkpoint_errors_test.go",
         "network_test.go",
         "sandbox_zombie_test.go",
+        "signal_test.go",
     ],
     library = ":sandbox",
     deps = [

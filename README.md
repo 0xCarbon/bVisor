@@ -71,7 +71,10 @@ git clone https://github.com/0xCarbon/kara
 cd kara
 
 # bazel (authoritative; regenerates stateify autogen)
-bazel build //runsc:runsc
+bazel build //:release
+
+# Keep runsc and its matching gvisor-bin/ sidecars together.
+export PATH="$PWD/bazel-bin/release:$PATH"
 
 # run a sandbox with the egress gate + an external gofer
 runsc --network=sandbox --overlay2=none --directfs=false \
@@ -100,7 +103,7 @@ managed-e2e suite as CI gates.
 ## Upstream policy
 
 - `upstream` = `google/gvisor` `master`; syncs are merge commits, gated by
-  `bazel build //runsc:runsc` plus the fork's test targets before push.
+  `bazel build //:release` plus the fork's test targets before push.
 - The fork never rewinds upstream behavior: fork features fail closed and
   stay no-ops when their flags are unset (nil gate / no `--io-fds` = stock).
 - Wire formats and ABI surfaces the fork introduces (`EgressGate` protocol,

@@ -3,9 +3,9 @@
 # Jobs:
 #   unit          - every bazel-visible test target the fork added or
 #                   changed over waves 01-06 (unprivileged).
-#   container-root- the root-required container regression subset plus the
+#   container-root- command tests, the container regression subset, and the
 #                   runsc/library reference embedder suite, run as root
-#                   against a bazel-built static runsc via the validated
+#                   against a bazel-built release via the validated
 #                   _main runfiles layout (tools/kara_regression.sh), on
 #                   the systrap and kvm platforms.
 #   oca-e2e       - manual / cross-repo-triggered: checks out the private
@@ -52,12 +52,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# NOTE (2026-08-19): the bazel jobs on GitHub-hosted runners fail on a
-# shared-infra issue (the pre-existing go.yml bazel jobs also fail on
-# master: "plain-go-consumer", "generate"). The fork's regression suite is
-# fully validated on a self-hosted privileged runner (see .wip/notes-wave06.md).
-# First-merge: continue-on-error until the GH-runner bazel issue is triaged
-# or the workflow is moved to a self-hosted runner.
 jobs:
   unit:
     name: fork regression unit targets (bazel)
@@ -66,33 +60,24 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Install bazelisk as bazel
-        run: |
-          set -euo pipefail
-          sudo curl -L -o /usr/local/bin/bazel \
-            https://github.com/bazelbuild/bazelisk/releases/download/v1.19.0/bazelisk-linux-amd64
-          sudo chmod +x /usr/local/bin/bazel
-          bazel --version
       - name: Checkout
         uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-bazel
       - name: Run fork regression unit targets
         run: |
           set -euo pipefail
           # Waves 01-06 fork-added test surface that bazel can run
           # unprivileged. The root-required subset lives in container-root.
-          # Note: runsc/cmd re-executes itself through a user namespace at
-          # TestMain (MaybeRunAsRoot); hardened self-hosted runners that
-          # deny exec of /proc/self/exe inside user namespaces will fail
-          # there - that is an environment restriction, not a regression
-          # (reproduces on such hosts at master too).
-          bazel test \
+          # runsc/cmd also runs there: its TestMain needs root, and hosted
+          # runners restrict unprivileged user namespace creation.
+          bazel test --test_output=errors \
             //pkg/flipcall:flipcall_layout_test \
             //pkg/hostifc:hostifc_test \
             //pkg/lisafs:abi_conformance_test \
             //pkg/lisafs:fuzz_test \
             //pkg/tcpip/tests/integration:egress_gate_test \
             //runsc/boot:egress_gate_test \
-            //runsc/cmd:cmd_test \
+            //runsc/cmd/alias/bwrap:bwrap_test \
             //runsc/compat:compat_test \
             //runsc/fsgofer:lisafs_test \
             //runsc/sandbox:sandbox_test
@@ -120,24 +105,18 @@ jobs:
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "No /dev/kvm on this runner; skipping the kvm leg."
           fi
-      - name: Install bazelisk as bazel
-        if: steps.kvm.outputs.available != 'false'
-        run: |
-          set -euo pipefail
-          sudo curl -L -o /usr/local/bin/bazel \
-            https://github.com/bazelbuild/bazelisk/releases/download/v1.19.0/bazelisk-linux-amd64
-          sudo chmod +x /usr/local/bin/bazel
-          bazel --version
       - name: Checkout
         if: steps.kvm.outputs.available != 'false'
         uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-bazel
+        if: steps.kvm.outputs.available != 'false'
       - name: Build and run the root regression subset
         if: steps.kvm.outputs.available != 'false'
         env:
           PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          # The script builds the static runsc + test binaries with bazel,
+          # The script builds the release + test binaries with bazel,
           # lays out the _main runfiles shape testutil.ConfigureExePath
           # needs, and runs the suite as root.
           tools/kara_regression.sh -p "$PLATFORM"
@@ -170,21 +149,15 @@ jobs:
               "repository (it also feeds oca's private-go-auth action)." >&2
             exit 1
           fi
-      - name: Install bazelisk as bazel
-        run: |
-          set -euo pipefail
-          sudo curl -L -o /usr/local/bin/bazel \
-            https://github.com/bazelbuild/bazelisk/releases/download/v1.19.0/bazelisk-linux-amd64
-          sudo chmod +x /usr/local/bin/bazel
-          bazel --version
       - name: Checkout kara
         uses: actions/checkout@v5
-      - name: Build static kara runsc
+      - uses: ./.github/actions/setup-bazel
+      - name: Build kara release
         run: |
           set -euo pipefail
-          bazel build //runsc:runsc
+          bazel build //:release
           mkdir -p bin
-          cp bazel-bin/runsc/runsc_/runsc bin/runsc
+          cp -a bazel-bin/release/. bin/
           chmod +x bin/runsc
           file bin/runsc
       - name: Checkout oca

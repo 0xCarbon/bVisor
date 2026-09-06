@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,6 +44,8 @@ import (
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
+var libraryPlatform = flag.String("library-platform", "", "Platform for library lifecycle tests (empty uses the runsc default).")
+
 func TestMain(m *testing.M) {
 	config.RegisterFlags(flag.CommandLine)
 	log.SetLevel(log.Debug)
@@ -54,6 +57,33 @@ func TestMain(m *testing.M) {
 		os.Exit(123)
 	}
 	os.Exit(m.Run())
+}
+
+// Removed checkpoint modes must fail before accessing a container or creating
+// files; preserving the option fields must not silently change their meaning.
+func TestSplitFilesystemOptionsRejected(t *testing.T) {
+	var rt library.Runtime
+	var c library.Container
+	dir := t.TempDir()
+	_, checkpointErr := c.Checkpoint(library.CheckpointOptions{ImagePath: dir, SplitFSCheckpoint: true})
+	_, restoreErr := rt.Restore(library.RestoreOptions{ImagePath: dir, SplitFSRestore: true})
+	containerRestoreErr := c.Restore(library.RestoreOptions{ImagePath: dir, SplitFSRestore: true})
+	for name, err := range map[string]error{
+		"checkpoint":        checkpointErr,
+		"runtime restore":   restoreErr,
+		"container restore": containerRestoreErr,
+	} {
+		if err == nil || !strings.Contains(err.Error(), "no longer supported") {
+			t.Errorf("%s error = %v, want unsupported split filesystem error", name, err)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("unsupported operations created files: %v", entries)
+	}
 }
 
 // defaultConfig returns the runsc flag-registration defaults — the config a
@@ -79,6 +109,9 @@ func defaultConfig(t *testing.T) *config.Config {
 func newTestRuntime(t *testing.T) (*library.Runtime, string) {
 	t.Helper()
 	def := defaultConfig(t)
+	if *libraryPlatform != "" {
+		def.Platform = *libraryPlatform
+	}
 	rootDir, err := os.MkdirTemp(testutil.TmpDir(), "library-root")
 	if err != nil {
 		t.Fatalf("os.MkdirTemp: %v", err)
@@ -114,8 +147,12 @@ func TestRuntimeConfigArgvFree(t *testing.T) {
 	if conf.RootDir != rootDir {
 		t.Errorf("Config().RootDir = %q, want %q", conf.RootDir, rootDir)
 	}
-	if conf.Platform != def.Platform {
-		t.Errorf("Config().Platform = %q, want default %q", conf.Platform, def.Platform)
+	wantPlatform := def.Platform
+	if *libraryPlatform != "" {
+		wantPlatform = *libraryPlatform
+	}
+	if conf.Platform != wantPlatform {
+		t.Errorf("Config().Platform = %q, want %q", conf.Platform, wantPlatform)
 	}
 	if conf.Network != config.NetworkNone {
 		t.Errorf("Config().Network = %v, want %v (Options.Network)", conf.Network, config.NetworkNone)

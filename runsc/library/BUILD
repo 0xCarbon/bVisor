@@ -35,6 +35,7 @@ go_test(
     name = "library_test",
     size = "large",
     srcs = ["library_test.go"],
+    data = ["//:release"],
     library = ":library",
     deps = [
         "//pkg/log",
