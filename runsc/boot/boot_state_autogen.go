@@ -19,6 +19,7 @@ func (c *sandboxNetstackCreator) StateFields() []string {
 		"allowLiveTCPMigration",
 		"uid",
 		"egressFD",
+		"egressGated",
 	}
 }
 
@@ -32,6 +33,7 @@ func (c *sandboxNetstackCreator) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(2, &c.allowLiveTCPMigration)
 	stateSinkObject.Save(3, &c.uid)
 	stateSinkObject.Save(4, &c.egressFD)
+	stateSinkObject.Save(5, &c.egressGated)
 }
 
 // +checklocksignore
@@ -41,6 +43,7 @@ func (c *sandboxNetstackCreator) StateLoad(ctx context.Context, stateSourceObjec
 	stateSourceObject.Load(2, &c.allowLiveTCPMigration)
 	stateSourceObject.Load(3, &c.uid)
 	stateSourceObject.Load(4, &c.egressFD)
+	stateSourceObject.Load(5, &c.egressGated)
 	stateSourceObject.AfterLoad(func() { c.afterLoad(ctx) })
 }
 

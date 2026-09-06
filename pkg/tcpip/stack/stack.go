@@ -2371,13 +2371,30 @@ type EgressGate interface {
 	CheckL7(dst tcpip.FullAddress, prefix []byte) (needMore bool, err tcpip.Error)
 }
 
-// EgressGate returns the stack's egress gate, or nil if none is set.
+// missingEgressGate denies traffic when a restored stack requires a gate but
+// its caller did not supply one. The caller still owns any live gate's lifetime.
+type missingEgressGate struct{}
+
+func (missingEgressGate) CheckTCP(tcpip.FullAddress) tcpip.Error {
+	return &tcpip.ErrConnectionRefused{}
+}
+
+func (missingEgressGate) CheckUDP(tcpip.FullAddress) tcpip.Error {
+	return &tcpip.ErrConnectionRefused{}
+}
+
+func (missingEgressGate) CheckL7(tcpip.FullAddress, []byte) (bool, tcpip.Error) {
+	return false, &tcpip.ErrConnectionRefused{}
+}
+
+// EgressGate returns the stack's egress gate, or nil if none is required.
+// If restore omitted a required gate, the returned gate denies all checks.
 func (s *Stack) EgressGate() EgressGate {
 	return s.egressGate
 }
 
-// EgressGated reports whether the stack was created with an egress gate
-// (which may since have been restored away to nil; see CtxEgressGate).
+// EgressGated reports whether the stack requires egress enforcement, including
+// enforcement added during restore. See CtxEgressGate.
 func (s *Stack) EgressGated() bool {
 	return s.egressGated
 }
