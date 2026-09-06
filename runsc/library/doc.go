@@ -44,6 +44,10 @@
 //
 // # Lifecycle
 //
+// Build //:release and keep its runsc and gvisor-bin/ directory together.
+// Standalone embedders set Options.ExePath to that runsc binary. Sidecars
+// are required by the default configuration and must match the release.
+//
 //	rt, err := library.New(library.Options{Root: "/run/rt", Platform: "systrap"})
 //	c, err := rt.Create(library.CreateOptions{ID: "web0", Spec: spec, BundleDir: dir})
 //	err = c.Start()

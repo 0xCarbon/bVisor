@@ -22,24 +22,14 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/version"
 	"gvisor.dev/gvisor/pkg/sentry/syscalls"
 )
 
 // AMD64 is a table of Linux amd64 syscall API with the corresponding syscall
 // numbers from Linux 4.4.
 var AMD64 = &kernel.SyscallTable{
-	OS:   abi.Linux,
-	Arch: arch.AMD64,
-	Version: kernel.Version{
-		// Version 4.4 is chosen as a stable, longterm version of Linux, which
-		// guides the interface provided by this syscall table. The build
-		// version is that for a clean build with default kernel config, at 5
-		// minutes after v4.4 was tagged.
-		Sysname: version.LinuxSysname,
-		Release: version.LinuxRelease,
-		Version: version.LinuxVersion,
-	},
+	OS:          abi.Linux,
+	Arch:        arch.AMD64,
 	AuditNumber: linux.AUDIT_ARCH_X86_64,
 	Table: map[uintptr]kernel.Syscall{
 		0:   syscalls.SupportedPoint("read", Read, PointRead),
@@ -371,7 +361,7 @@ var AMD64 = &kernel.SyscallTable{
 
 		// Syscalls implemented after 325 are "backports" from versions
 		// of Linux after 4.4.
-		326: syscalls.ErrorWithEvent("copy_file_range", linuxerr.ENOSYS, "", nil),
+		326: syscalls.Supported("copy_file_range", CopyFileRange),
 		327: syscalls.PartiallySupportedPoint("preadv2", Preadv2, PointPreadv2, "RWF flags are not supported.", []string{"gvisor.dev/issue/2601"}),
 		328: syscalls.PartiallySupportedPoint("pwritev2", Pwritev2, PointPwritev2, "RWF flags are not supported.", []string{"gvisor.dev/issue/2601"}),
 		329: syscalls.ErrorWithEvent("pkey_mprotect", linuxerr.ENOSYS, "", nil),
@@ -395,6 +385,7 @@ var AMD64 = &kernel.SyscallTable{
 		434: syscalls.Supported("pidfd_open", PIDFDOpen),
 		435: syscalls.PartiallySupported("clone3", Clone3, "Options CLONE_NEWTIME, CLONE_SYSVSEM and SetTid are not supported.", nil),
 		436: syscalls.Supported("close_range", CloseRange),
+		437: syscalls.Supported("openat2", Openat2),
 		438: syscalls.Supported("pidfd_getfd", PIDFDGetFD),
 		439: syscalls.Supported("faccessat2", Faccessat2),
 		441: syscalls.Supported("epoll_pwait2", EpollPwait2),
@@ -413,13 +404,8 @@ var AMD64 = &kernel.SyscallTable{
 // ARM64 is a table of Linux arm64 syscall API with the corresponding syscall
 // numbers from Linux 4.4.
 var ARM64 = &kernel.SyscallTable{
-	OS:   abi.Linux,
-	Arch: arch.ARM64,
-	Version: kernel.Version{
-		Sysname: version.LinuxSysname,
-		Release: version.LinuxRelease,
-		Version: version.LinuxVersion,
-	},
+	OS:          abi.Linux,
+	Arch:        arch.ARM64,
 	AuditNumber: linux.AUDIT_ARCH_AARCH64,
 	Table: map[uintptr]kernel.Syscall{
 		0:   syscalls.PartiallySupported("io_setup", IoSetup, "Generally supported with exceptions. User ring optimizations are not implemented.", []string{"gvisor.dev/issue/204"}),
@@ -693,7 +679,7 @@ var ARM64 = &kernel.SyscallTable{
 		284: syscalls.PartiallySupported("mlock2", Mlock2, "Stub implementation. The sandbox lacks appropriate permissions.", nil),
 
 		// Syscalls after 284 are "backports" from versions of Linux after 4.4.
-		285: syscalls.ErrorWithEvent("copy_file_range", linuxerr.ENOSYS, "", nil),
+		285: syscalls.Supported("copy_file_range", CopyFileRange),
 		286: syscalls.PartiallySupportedPoint("preadv2", Preadv2, PointPreadv2, "RWF flags are not supported.", []string{"gvisor.dev/issue/2601"}),
 		287: syscalls.PartiallySupportedPoint("pwritev2", Pwritev2, PointPwritev2, "RWF flags are not supported.", []string{"gvisor.dev/issue/2601"}),
 		288: syscalls.ErrorWithEvent("pkey_mprotect", linuxerr.ENOSYS, "", nil),
@@ -717,6 +703,7 @@ var ARM64 = &kernel.SyscallTable{
 		434: syscalls.Supported("pidfd_open", PIDFDOpen),
 		435: syscalls.PartiallySupported("clone3", Clone3, "Options CLONE_NEWTIME, CLONE_SYSVSEM and clone_args.set_tid are not supported.", nil),
 		436: syscalls.Supported("close_range", CloseRange),
+		437: syscalls.Supported("openat2", Openat2),
 		438: syscalls.Supported("pidfd_getfd", PIDFDGetFD),
 		439: syscalls.Supported("faccessat2", Faccessat2),
 		441: syscalls.Supported("epoll_pwait2", EpollPwait2),

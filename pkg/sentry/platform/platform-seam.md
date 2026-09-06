@@ -29,6 +29,7 @@ their seams:
 | `pkg/eventfd` | eventfd(2) | `Create` and I/O return `errors.ErrUnsupported`; descriptor bookkeeping (Wrap/FD/Close/Dup) stays |
 | `pkg/seccomp` | prctl(2) seccomp | `SetFilter` → `ErrUnsupported`, `SetFilterInChild` → ENOSYS; BPF building stays portable |
 | `pkg/sentry/hostmm` | membarrier(2) | `Probe` reports no support; syscall helpers return ENOSYS |
+| `pkg/pinring` | disabled io_uring FD pinning + pidfd exit notification | ring creation, registration and pidfd donation return `errors.ErrUnsupported`; exit notification never claims a confirmed exit |
 | `pkg/sentry/platform` | `/proc/sys/vm/mmap_min_addr` init read | reports 0; `MMapMinAddr` embed documented Linux-only |
 | `pkg/hostifc` (new) | — | the seam itself: `IPC` factory + `ControlSocket`/stream FD donation + `ControlPlane` probes; `ErrUnsupported` fail-closed backend |
 
