@@ -165,6 +165,7 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 		SplitFSRestore:     r.splitFSRestore,
 		IOFDs:              r.ioFDs,
 		EgressFD:           optionalFD(r.egressFD),
+		IngressFD:          optionalFD(r.ingressFD),
 	}
 
 	log.Debugf("Restore container, cid: %s, rootDir: %q", id, conf.RootDir)

@@ -69,6 +69,11 @@ type Create struct {
 	// egress data path is disabled (Oca #447). Re-donated to the sandbox.
 	egressFD int
 
+	// ingressFD is the AF_UNIX FD to the Oca host-ingress relay, or -1 when
+	// the ingress data path is disabled (Oca #541). Re-donated to the
+	// sandbox.
+	ingressFD int
+
 	// spec is the cached OCI spec.
 	spec *specs.Spec
 }
@@ -107,6 +112,7 @@ func (c *Create) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&c.fsRestoreDirect, "fs-restore-direct", false, "open files in fs-restore-image-path with O_DIRECT")
 	f.Var(&c.ioFDs, "io-fds", "list of FDs for an external gofer's sandbox-side connections (lisafs), in gofer-mount order (root first). When set, runsc does not spawn its own gofer and does not execute CreateContainer hooks; the external gofer/harness owns them (specs with CreateContainer hooks are rejected).")
 	f.IntVar(&c.egressFD, "egress-fd", -1, "AF_UNIX FD to the Oca egress flow gate (Oca #447), re-donated to the sandbox; -1 disables egress enforcement")
+	f.IntVar(&c.ingressFD, "ingress-fd", -1, "AF_UNIX FD to the Oca host-ingress relay (Oca #541), re-donated to the sandbox; -1 disables host ingress")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
@@ -161,6 +167,7 @@ func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcom
 		FSRestoreDirect:    c.fsRestoreDirect,
 		IOFDs:              c.ioFDs,
 		EgressFD:           optionalFD(c.egressFD),
+		IngressFD:          optionalFD(c.ingressFD),
 	}
 	if _, err := container.New(conf, contArgs); err != nil {
 		return util.Errorf("creating container: %v", err)

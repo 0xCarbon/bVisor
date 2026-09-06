@@ -170,6 +170,7 @@ func (r *Run) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomman
 		FSRestoreDirect:    r.fsRestoreDirect,
 		IOFDs:              r.ioFDs,
 		EgressFD:           optionalFD(r.egressFD),
+		IngressFD:          optionalFD(r.ingressFD),
 	}
 	ws, err := container.Run(conf, runArgs)
 	if err != nil {
