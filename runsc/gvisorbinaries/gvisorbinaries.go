@@ -118,18 +118,54 @@ var ReleaseEnforcementPolicy = config.SidecarReleaseNever
 // Set from config flag.
 var UsagePolicy = config.SidecarUsageDefault
 
+// Resolver selects sidecars and their launch policies for one configuration.
+// Use ForConfig for independent embedded runtimes. It snapshots the supplied
+// fields and is safe to share between goroutines. Environment overrides retain
+// their documented process-wide meaning.
+type Resolver struct {
+	executablePath string
+	usagePolicy    config.SidecarUsagePolicy
+	releasePolicy  config.SidecarReleasePolicy
+}
+
+// ForConfig returns a resolver for conf without changing or caching any
+// process-global launcher state.
+func ForConfig(conf *config.Config) Resolver {
+	return Resolver{
+		executablePath: specutils.ExecutablePath(conf),
+		usagePolicy:    conf.SidecarUsagePolicy,
+		releasePolicy:  conf.SidecarReleaseEnforcementPolicy,
+	}
+}
+
+func defaultResolver() Resolver {
+	return Resolver{usagePolicy: UsagePolicy, releasePolicy: ReleaseEnforcementPolicy}
+}
+
+func (r Resolver) dir() (string, error) {
+	if r.executablePath == "" {
+		return Dir()
+	}
+	return resolveDirForExecutable(r.executablePath)
+}
+
 // WithEnforceRelease returns envv with `GVISOR_ENFORCE_RELEASE` set for
 // sidecar processes. Exec and ForkExec apply it automatically
 // Callers that spawn a sidecar through other means (manual `exec.Cmd`)
 // must apply it to the sidecar process's env themselves.
 func WithEnforceRelease(envv []string) []string {
+	return defaultResolver().WithEnforceRelease(envv)
+}
+
+// WithEnforceRelease applies this resolver's release policy to sidecar envv.
+func (r Resolver) WithEnforceRelease(envv []string) []string {
 	val := os.Getenv(enforceReleaseEnv)
 	prefix, want := "", ""
 	if w, ok := cutSkip(val, enforceReleaseTestonlySkip); ok {
 		prefix, want = enforceReleaseTestonlySkip, w
 	} else if w, ok := cutSkip(val, enforceReleaseSkip); ok {
 		prefix, want = enforceReleaseSkip, w
-	} else if !ReleaseEnforcementPolicy.Applies() {
+	} else if !r.releasePolicy.Applies() {
 		prefix = enforceReleaseSkip
 	}
 	value := version.Version()
@@ -285,16 +321,20 @@ var (
 
 // resolveDir resolves the directory in which sidecar binaries are located.
 func resolveDir() (string, error) {
+	return resolveDirForExecutable(specutils.ExePath)
+}
+
+func resolveDirForExecutable(executablePath string) (string, error) {
 	if dir := os.Getenv(sidecarBinariesDirEnv); dir != "" {
 		return dir, nil
 	}
-	dir := filepath.Join(filepath.Dir(specutils.ExePath), binDirName)
+	dir := filepath.Join(filepath.Dir(executablePath), binDirName)
 	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
 		return dir, nil
 	}
-	exe, err := filepath.EvalSymlinks(specutils.ExePath)
+	exe, err := filepath.EvalSymlinks(executablePath)
 	if err != nil {
-		return "", fmt.Errorf("cannot resolve path to runsc binary %q: %w", specutils.ExePath, err)
+		return "", fmt.Errorf("cannot resolve path to runsc binary %q: %w", executablePath, err)
 	}
 	return filepath.Join(filepath.Dir(exe), binDirName), nil
 }
@@ -311,7 +351,12 @@ func Dir() (string, error) {
 // Path returns the path to a usable on-disk copy of the binary.
 // Returns error if not present or executable.
 func (b *Binary) Path() (string, error) {
-	dir, err := Dir()
+	return defaultResolver().Path(b)
+}
+
+// Path returns a usable sidecar from this resolver's runsc installation.
+func (r Resolver) Path(b *Binary) (string, error) {
+	dir, err := r.dir()
 	if err != nil {
 		return "", err
 	}
@@ -331,8 +376,8 @@ func (b *Binary) Path() (string, error) {
 
 // expectedPath returns the path at which the on-disk copy of the binary is
 // expected to exist.
-func (b *Binary) expectedPath() (string, error) {
-	dir, err := Dir()
+func (r Resolver) expectedPath(b *Binary) (string, error) {
+	dir, err := r.dir()
 	if err != nil {
 		return "", err
 	}
@@ -341,12 +386,12 @@ func (b *Binary) expectedPath() (string, error) {
 
 // notAvailableError returns an error for the case where the binary is
 // not available.
-func (b *Binary) notAvailableError() error {
-	p, err := b.expectedPath()
+func (r Resolver) notAvailableError(b *Binary) error {
+	p, err := r.expectedPath(b)
 	if err != nil {
 		return err
 	}
-	if UsagePolicy == config.SidecarUsageStrict {
+	if r.usagePolicy == config.SidecarUsageStrict {
 		return fmt.Errorf("sidecar binary %q not found (expected at %q) and --sidecar-usage-policy is set to STRICT; install it per https://gvisor.dev/docs/user_guide/install/ instructions", b.Name, p)
 	}
 	return fmt.Errorf("sidecar binary %q not found (expected at %q); install it per https://gvisor.dev/docs/user_guide/install/ instructions", b.Name, p)
@@ -354,11 +399,16 @@ func (b *Binary) notAvailableError() error {
 
 // WarnUnavailable logs an appropriate warning when the sidecar binary is not found on disk.
 func (b *Binary) WarnUnavailable(action string) {
-	expected, err := b.expectedPath()
+	defaultResolver().WarnUnavailable(b, action)
+}
+
+// WarnUnavailable logs a missing-sidecar warning using this resolver's policy.
+func (r Resolver) WarnUnavailable(b *Binary, action string) {
+	expected, err := r.expectedPath(b)
 	if err != nil {
 		expected = filepath.Join(binDirName, b.Name)
 	}
-	switch UsagePolicy {
+	switch r.usagePolicy {
 	case config.SidecarUsageStrict:
 		log.Warningf("Sidecar binary %q not found (expected at %q) and --sidecar-usage-policy is set to STRICT.", b.Name, expected)
 	case config.SidecarUsageLegacyEmbedded:
@@ -369,38 +419,48 @@ func (b *Binary) WarnUnavailable(action string) {
 }
 
 // TODO(gvisor.dev/issue/13718): remove along with the embedded fallback.
-func (b *Binary) warnEmbeddedDeprecated(opts *Options) {
-	b.WarnUnavailable(fmt.Sprintf("Executing embedded copy of sidecar %q (%v)", b.Name, opts))
+func (r Resolver) warnEmbeddedDeprecated(b *Binary, opts *Options) {
+	r.WarnUnavailable(b, fmt.Sprintf("Executing embedded copy of sidecar %q (%v)", b.Name, opts))
 }
 
 // Exec resolves the binary and replaces the current process with it. It only
 // returns if execution could not be started.
 func (b *Binary) Exec(opts Options) error {
-	opts.Envv = WithEnforceRelease(opts.Envv)
-	if p, err := b.Path(); err == nil {
+	return defaultResolver().Exec(b, opts)
+}
+
+// Exec resolves b with this configuration and replaces the current process.
+func (r Resolver) Exec(b *Binary, opts Options) error {
+	opts.Envv = r.WithEnforceRelease(opts.Envv)
+	if p, err := r.Path(b); err == nil {
 		log.Infof("sidecar %q found: executing %s (%v)", b.Name, p, &opts)
 		return execDisk(p, opts)
 	}
-	if UsagePolicy.AllowEmbeddedFallback() && b.embeddedExec != nil {
-		b.warnEmbeddedDeprecated(&opts)
+	if r.usagePolicy.AllowEmbeddedFallback() && b.embeddedExec != nil {
+		r.warnEmbeddedDeprecated(b, &opts)
 		return b.embeddedExec(opts)
 	}
-	return b.notAvailableError()
+	return r.notAvailableError(b)
 }
 
 // ForkExec resolves the binary and runs it in a new process, returning the
 // child's PID.
 func (b *Binary) ForkExec(opts Options) (int, error) {
-	opts.Envv = WithEnforceRelease(opts.Envv)
-	if p, err := b.Path(); err == nil {
+	return defaultResolver().ForkExec(b, opts)
+}
+
+// ForkExec resolves b with this configuration and starts a child process.
+func (r Resolver) ForkExec(b *Binary, opts Options) (int, error) {
+	opts.Envv = r.WithEnforceRelease(opts.Envv)
+	if p, err := r.Path(b); err == nil {
 		log.Infof("sidecar %q: executing %s (%v)", b.Name, p, &opts)
 		return forkExecDisk(p, opts)
 	}
-	if UsagePolicy.AllowEmbeddedFallback() && b.embeddedForkExec != nil {
-		b.warnEmbeddedDeprecated(&opts)
+	if r.usagePolicy.AllowEmbeddedFallback() && b.embeddedForkExec != nil {
+		r.warnEmbeddedDeprecated(b, &opts)
 		return b.embeddedForkExec(opts)
 	}
-	return 0, b.notAvailableError()
+	return 0, r.notAvailableError(b)
 }
 
 // execDisk execs an on-disk binary.

@@ -96,6 +96,15 @@ const (
 // changed in tests that aren't linked in the same binary.
 var ExePath = "/proc/self/exe"
 
+// ExecutablePath returns the launcher's configured runsc binary. Embedders
+// should set Config.ExecutablePath instead of changing the process-wide default.
+func ExecutablePath(conf *config.Config) string {
+	if conf.ExecutablePath != "" {
+		return conf.ExecutablePath
+	}
+	return ExePath
+}
+
 // Version is the supported spec version.
 var Version = specs.Version
 

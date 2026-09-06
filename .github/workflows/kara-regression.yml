@@ -82,6 +82,8 @@ jobs:
             //runsc/cmd/alias/bwrap:bwrap_test \
             //runsc/compat:compat_test \
             //runsc/fsgofer:lisafs_test \
+            //runsc/gvisorbinaries:gvisorbinaries_test \
+            //runsc/library:library_unit_test \
             //runsc/sandbox:sandbox_test
 
   ingress-race:

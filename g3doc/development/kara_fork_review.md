@@ -31,14 +31,15 @@ a narrow test does not establish that the remaining areas are complete.
 These are review leads, not claims that every suspected problem has been
 reproduced. Each correction will record its regression evidence below.
 
-- `Runtime.ExePath` temporarily changes a global executable path; sidecar lookup
-  caches the first installation globally. Concurrent and sequential runtimes
-  need independent launcher selection.
-- Library gofer and egress donations close caller files before success and use
-  raw descriptor cleanup that can outlive the owning `os.File`. Other donations
-  need the same ownership audit.
-- Library spec annotations use global flag registration/configuration paths,
-  and restore reads the bundle even when restoring an existing container.
+- Library configuration annotations are applied by the CLI entry point, which
+  library calls bypass. Supporting them requires independent configuration and
+  flag sets for each operation, and retaining the effective configuration for
+  subsequent lifecycle calls.
+- Directly supplied library specs need validation and private copies before
+  lower-level setup mutates them. Runtime configuration also needs an explicit
+  snapshot contract.
+- Control transport aliases need an audit across guest stdio and explicit guest
+  file donations, including egress and external gofer transports.
 
 ## Verified corrections
 
@@ -107,3 +108,43 @@ support from non-Linux compilation scaffolding. They also identify the generated
 Go distribution required by external consumers, distinguish that tooling from
 an all-Go runtime implementation, and list the previously omitted fork PRs.
 These are documentation corrections; they do not add another host backend.
+
+### Library launcher isolation
+
+Concurrent embedded runtimes no longer change `specutils.ExePath`. Each runtime
+snapshots its executable path, which is used for gofer and sentry launch and
+later checkpoint-gofer launch. A per-configuration sidecar resolver also carries
+the sidecar usage and release policies, so one installation cannot reuse the
+directory cached for another installation. Existing process-global CLI APIs
+remain available.
+
+An eight-runtime concurrent-create regression reproduced the global path race
+before the fix. It and `//runsc/gvisorbinaries:gvisorbinaries_test` pass with the
+race detector, including concurrent child launches from two fake installations
+and independent release/fallback policies.
+
+### Library donation ownership and restore adoption
+
+Create and fresh restore duplicate all donated files with `F_DUPFD_CLOEXEC` and
+consume originals only after the whole operation succeeds. Execute and
+PortForward use the same ownership transaction and private argument copies.
+Cleanup retains the same `os.File` owners throughout lower-level launch, avoiding
+raw descriptor closes after a number has been reused. New owned-file forms of
+gofer and egress donations retain the legacy raw descriptor API for CLI callers.
+
+Existing-container restore loads its stored spec before consulting a bundle and
+rejects create-time donations that the restore RPC cannot replace. Fresh restore
+retains all originals if restoration fails after successful container creation.
+
+The unprivileged library target reproduces the previous premature-close failures
+and covers partial acquisition, CLOEXEC, descriptor reuse, and adoption without
+the original bundle. It passes with the race detector. The full release and root
+command, container, and library regression suites pass on systrap and KVM. Root
+tests verify successful ownership transfer, failure after sandbox launch, failed
+restore, and successful re-donation across a real checkpoint/restore.
+
+Execute and PortForward RPC regressions also pass on both platforms. They verify
+remote errors retain originals, successful calls consume them, argument objects
+remain unchanged, and guest exec output and bidirectional forwarding continue
+through the sandbox's copies. Final CI and external-gofer consumer validation
+remain pending for this follow-up.

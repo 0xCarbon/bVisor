@@ -50,6 +50,11 @@ import (
 //     if it is no longer needed at all.
 //  2. Add the flag to flags_graveyard.go and remove it from flags.go.
 type Config struct {
+	// ExecutablePath selects the runsc installation used by this launcher.
+	// Empty uses specutils.ExePath. This is launcher configuration, not a
+	// command-line flag or an OCI annotation override.
+	ExecutablePath string
+
 	// RootDir is the runtime root directory.
 	RootDir string `flag:"root"`
 

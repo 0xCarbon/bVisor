@@ -2437,8 +2437,8 @@ func TestPortForwardDialProbe(t *testing.T) {
 			if string(reply) != replyMsg {
 				t.Errorf("probe got %q, want %q", string(reply), replyMsg)
 			}
-			// PortForward blocks for the lifetime of the forwarded
-			// connection; closing both ends lets it return.
+			// PortForward acknowledges setup; forwarding continues in the
+			// sandbox until the connection is closed.
 			conn.Close()
 			probeClient.Close()
 			select {

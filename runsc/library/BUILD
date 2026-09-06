@@ -12,6 +12,7 @@ go_library(
         "container.go",
         "doc.go",
         "errors.go",
+        "files.go",
         "library.go",
     ],
     visibility = ["//:sandbox"],
@@ -32,11 +33,29 @@ go_library(
 )
 
 go_test(
+    name = "library_unit_test",
+    size = "small",
+    srcs = [
+        "api_test.go",
+        "files_test.go",
+    ],
+    library = ":library",
+    deps = [
+        "//runsc/container",
+        "//runsc/sandbox",
+        "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
     name = "library_test",
     size = "large",
     srcs = [
         "ingress_test.go",
         "library_test.go",
+        "ownership_test.go",
     ],
     data = ["//:release"],
     library = ":library",
@@ -45,6 +64,8 @@ go_test(
         "//pkg/sentry/control",
         "//pkg/state/statefile",
         "//pkg/test/testutil",
+        "//pkg/urpc",
+        "//runsc/boot",
         "//runsc/boot/ingress",
         "//runsc/compat",
         "//runsc/config",

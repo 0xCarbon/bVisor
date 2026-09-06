@@ -346,6 +346,10 @@ func TestLibraryEmbedderLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rt.Create: %v", err)
 	}
+	if _, err := pipeARead.Stat(); !errors.Is(err, os.ErrClosed) {
+		c.Destroy()
+		t.Fatalf("successful Create retained the donated pipe: %v", err)
+	}
 	if err := c.Start(); err != nil {
 		t.Fatalf("c.Start: %v", err)
 	}
@@ -392,6 +396,9 @@ func TestLibraryEmbedderLifecycle(t *testing.T) {
 		t.Fatalf("rt.Restore: %v", err)
 	}
 	defer c2.Destroy()
+	if _, err := pipeBRead.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("successful Restore retained the donated pipe: %v", err)
+	}
 	if state := c2.State(); state.Status != specs.StateRunning {
 		t.Fatalf("restored container state = %q, want %q", state.Status, specs.StateRunning)
 	}
