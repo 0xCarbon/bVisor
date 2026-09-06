@@ -22,6 +22,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -36,6 +37,7 @@ type fakeGate struct {
 	verdicts chan byte   // verdict to send per request (test feeds it)
 	reqs     chan []byte // received request bodies
 	done     chan struct{}
+	stop     chan struct{}
 }
 
 func newFakeGate(t *testing.T) (*fakeGate, *os.File) {
@@ -44,16 +46,27 @@ func newFakeGate(t *testing.T) (*fakeGate, *os.File) {
 	if err != nil {
 		t.Fatalf("socketpair: %v", err)
 	}
-	fg := &fakeGate{t: t, verdicts: make(chan byte, 16), reqs: make(chan []byte, 16), done: make(chan struct{})}
+	fg := &fakeGate{t: t, verdicts: make(chan byte, 16), reqs: make(chan []byte, 16), done: make(chan struct{}), stop: make(chan struct{})}
 	clientFile := os.NewFile(uintptr(fds[0]), "gate-client-fd")
 	peerFile := os.NewFile(uintptr(fds[1]), "gate-peer-fd")
+	c, err := net.FileConn(peerFile)
+	peerFile.Close()
+	if err != nil {
+		clientFile.Close()
+		t.Fatalf("peer FileConn: %v", err)
+	}
+	t.Cleanup(func() {
+		clientFile.Close()
+		close(fg.stop)
+		c.Close()
+		select {
+		case <-fg.done:
+		case <-time.After(5 * time.Second):
+			t.Error("fake gate did not stop")
+		}
+	})
 	go func() {
 		defer close(fg.done)
-		defer peerFile.Close()
-		c, err := net.FileConn(peerFile)
-		if err != nil {
-			return
-		}
 		defer c.Close()
 		for {
 			var lenb [4]byte
@@ -64,9 +77,19 @@ func newFakeGate(t *testing.T) (*fakeGate, *os.File) {
 			if _, err := io.ReadFull(c, body); err != nil {
 				return
 			}
-			fg.reqs <- body
-			v, ok := <-fg.verdicts
-			if !ok {
+			select {
+			case fg.reqs <- body:
+			case <-fg.stop:
+				return
+			}
+			var v byte
+			select {
+			case verdict, ok := <-fg.verdicts:
+				if !ok {
+					return
+				}
+				v = verdict
+			case <-fg.stop:
 				return
 			}
 			if _, err := c.Write([]byte{v}); err != nil {
@@ -88,6 +111,8 @@ func (fg *fakeGate) waitRequest() (kind byte, addr [16]byte, port uint16, prefix
 		return b[1], addr, binary.BigEndian.Uint16(b[18:20]), b[20:]
 	case <-fg.done:
 		fg.t.Fatal("gate connection closed before a request arrived")
+	case <-time.After(5 * time.Second):
+		fg.t.Fatal("gate did not receive a request")
 	}
 	return
 }
@@ -95,22 +120,21 @@ func (fg *fakeGate) waitRequest() (kind byte, addr [16]byte, port uint16, prefix
 func newTestClient(t *testing.T) (*fakeGate, *egressGateClient) {
 	t.Helper()
 	fg, f := newFakeGate(t)
-	fd := int(f.Fd())
-	c, err := newEgressGateClient(fd)
+	c, err := newEgressGateClientFile(f)
 	if err != nil {
 		t.Fatalf("newEgressGateClient: %v", err)
 	}
+	t.Cleanup(c.Close)
 	return fg, c
 }
 
 func TestEgressGateClientTCPVerdicts(t *testing.T) {
-	fg, c := newTestClient(t)
 	dst := tcpip.FullAddress{Addr: tcpip.AddrFrom4([4]byte{1, 2, 3, 4}), Port: 443}
 	for _, tc := range []struct {
 		verdict byte
 		wantErr bool
-	}{{egressGateVerdictAllow, false}, {egressGateVerdictNeedMore, true}, {3 /* deny */, true}, {0xff /* garbage */, true}} {
-		go func() {}()
+	}{{egressGateVerdictAllow, false}, {egressGateVerdictNeedMore, true}, {egressGateVerdictDeny, true}, {0xff /* garbage */, true}} {
+		fg, c := newTestClient(t)
 		res := make(chan tcpip.Error, 1)
 		go func() { res <- c.CheckTCP(dst) }()
 		kind, addr, port, _ := fg.waitRequest()
@@ -193,6 +217,8 @@ func TestEgressGateClientLoopbackExempt(t *testing.T) {
 		tcpip.AddrFrom4([4]byte{127, 0, 0, 1}),
 		tcpip.AddrFrom4([4]byte{}),
 		tcpip.AddrFrom16([16]byte{15: 1}), // ::1
+		tcpip.AddrFrom16([16]byte{}),      // ::
+		tcpip.AddrFrom16([16]byte{10: 0xff, 11: 0xff, 12: 127, 15: 1}),
 	} {
 		if err := c.CheckTCP(tcpip.FullAddress{Addr: a, Port: 80}); err != nil {
 			t.Fatalf("loopback %v: err = %v", a, err)
@@ -211,14 +237,14 @@ func TestEgressGateClientLoopbackExempt(t *testing.T) {
 func TestEgressGateClientFailClosed(t *testing.T) {
 	fg, c := newTestClient(t)
 	dst := tcpip.FullAddress{Addr: tcpip.AddrFrom4([4]byte{1, 1, 1, 1}), Port: 80}
-	// First request: the peer answers garbage framing length then stalls; the
-	// read times out and the client must fail closed.
+	// First request: the peer closes without replying. The client must fail
+	// closed and never reuse the connection.
 	res := make(chan tcpip.Error, 1)
 	go func() { res <- c.CheckTCP(dst) }()
 	fg.waitRequest()
-	close(fg.verdicts) // peer stops answering; deadline expires
+	close(fg.verdicts)
 	if err := <-res; err == nil {
-		t.Fatal("timed-out flow was allowed")
+		t.Fatal("flow with no verdict was allowed")
 	}
 	// Every subsequent flow must be denied without touching the wire.
 	if err := c.CheckTCP(dst); err == nil {

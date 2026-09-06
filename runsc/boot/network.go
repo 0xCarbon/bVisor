@@ -649,8 +649,8 @@ func ipMaskToAddressMask(ipMask net.IPMask) tcpip.AddressMask {
 // FAIL-CLOSED is the contract: any framing/IO/timeout error denies the flow AND
 // marks the connection dead, so no later flow is ever judged by a stale verdict
 // (a reused conn could read flow N's late reply as flow N+1's verdict). The host
-// handlers never block on IO (pure policy checks), so the per-flow round-trip
-// under the caller's endpoint lock is bounded. The wire format mirrors
+// call deadline includes waiting for other flows, so a slow host cannot create
+// an unbounded queue under the callers' endpoint locks. The wire format mirrors
 // github.com/0xCarbon/oca/network (gate.go) byte-for-byte; the leading version
 // byte makes any drift fail closed instead of misparsing the tuple.
 const (
@@ -658,6 +658,7 @@ const (
 	egressGateKindTCP         = 1
 	egressGateKindUDP         = 2
 	egressGateKindL7          = 3
+	egressGateVerdictDeny     = 0
 	egressGateVerdictAllow    = 1
 	egressGateVerdictNeedMore = 2
 	egressGateL7SniffLimit    = 32 * 1024
@@ -665,22 +666,50 @@ const (
 )
 
 type egressGateClient struct {
-	mu   sync.Mutex
 	conn net.Conn
-	dead bool
+	// turn serializes request/reply pairs, while allowing callers to stop
+	// waiting when their deadline expires or the client closes.
+	turn      chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
+// newEgressGateClient consumes fd, including on error.
 func newEgressGateClient(fd int) (*egressGateClient, error) {
-	f := os.NewFile(uintptr(fd), "oca-egress-fd")
+	f := os.NewFile(uintptr(fd), "egress-fd")
 	if f == nil {
-		return nil, fmt.Errorf("oca egress: invalid fd %d", fd)
+		return nil, fmt.Errorf("egress: invalid fd %d", fd)
 	}
+	return newEgressGateClientFile(f)
+}
+
+// newEgressGateClientFile consumes f, including on error. Keep the same file
+// owner when the donated descriptor already has an os.File wrapper.
+func newEgressGateClientFile(f *os.File) (*egressGateClient, error) {
+	defer f.Close()
 	conn, err := net.FileConn(f)
-	f.Close()
 	if err != nil {
-		return nil, fmt.Errorf("oca egress: FileConn(fd=%d): %w", fd, err)
+		return nil, fmt.Errorf("egress: FileConn: %w", err)
 	}
-	return &egressGateClient{conn: conn}, nil
+	if _, ok := conn.(*net.UnixConn); !ok || conn.LocalAddr().Network() != "unix" || conn.RemoteAddr() == nil {
+		conn.Close()
+		return nil, fmt.Errorf("egress: FD must be a connected Unix stream socket")
+	}
+	return egressGateClientForConn(conn), nil
+}
+
+func egressGateClientForConn(conn net.Conn) *egressGateClient {
+	return &egressGateClient{conn: conn, turn: make(chan struct{}, 1), done: make(chan struct{})}
+}
+
+// Close denies future egress checks and unblocks queued and active checks.
+// It must not wait for the request/reply lock: the active request may be
+// waiting for an unresponsive host. net.Conn permits Close concurrent with IO.
+func (c *egressGateClient) Close() {
+	c.closeOnce.Do(func() {
+		close(c.done)
+		_ = c.conn.Close()
+	})
 }
 
 // CheckTCP implements stack.EgressGate.
@@ -722,6 +751,10 @@ func (c *egressGateClient) CheckL7(dst tcpip.FullAddress, prefix []byte) (bool, 
 }
 
 func (c *egressGateClient) check(kind byte, dst tcpip.FullAddress, prefix []byte) (byte, tcpip.Error) {
+	deadline := time.Now().Add(egressGateCallTimeout)
+	if dst.Addr.Len() != 4 && dst.Addr.Len() != 16 {
+		return 0, &tcpip.ErrConnectionRefused{}
+	}
 	// Intra-sandbox loopback (and the unspecified address) never leave the
 	// netstack, so they are not egress and must not be gated — the guest's own
 	// 127.0.0.1/::1 services must keep working. Routed link-local/metadata
@@ -729,46 +762,80 @@ func (c *egressGateClient) check(kind byte, dst tcpip.FullAddress, prefix []byte
 	if egressGateIsLoopbackOrUnspecified(dst.Addr) {
 		return egressGateVerdictAllow, nil
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.dead {
+	return c.checkUntil(kind, dst, prefix, deadline)
+}
+
+// checkUntil includes queueing in the deadline. Expiry before sending a request
+// denies just that flow; any failure once IO starts closes the shared stream.
+func (c *egressGateClient) checkUntil(kind byte, dst tcpip.FullAddress, prefix []byte, deadline time.Time) (byte, tcpip.Error) {
+	select {
+	case c.turn <- struct{}{}:
+	default:
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		select {
+		case c.turn <- struct{}{}:
+		case <-c.done:
+			return 0, &tcpip.ErrConnectionRefused{}
+		case <-timer.C:
+			return 0, &tcpip.ErrConnectionRefused{}
+		}
+	}
+	defer func() { <-c.turn }()
+	select {
+	case <-c.done:
+		return 0, &tcpip.ErrConnectionRefused{}
+	default:
+	}
+	// Acquiring turn and expiring can happen together; do not send a request
+	// whose reply cannot be received within the caller's original budget.
+	if !time.Now().Before(deadline) {
 		return 0, &tcpip.ErrConnectionRefused{}
 	}
 	// body: version(1) kind(1) ip(16, v4 as v4-in-v6) port(2)
-	body := make([]byte, 20+len(prefix))
+	frame := make([]byte, 24+len(prefix))
+	body := frame[4:]
 	body[0] = egressGateProtocolVersion
 	body[1] = kind
 	ip16 := egressGateAddr16(dst.Addr)
 	copy(body[2:18], ip16[:])
 	binary.BigEndian.PutUint16(body[18:20], dst.Port)
 	copy(body[20:], prefix)
-	frame := make([]byte, 4+len(body))
 	binary.BigEndian.PutUint32(frame[0:4], uint32(len(body)))
-	copy(frame[4:], body)
 
-	_ = c.conn.SetDeadline(time.Now().Add(egressGateCallTimeout))
-	if _, err := c.conn.Write(frame[:]); err != nil {
-		c.failLocked()
+	if err := c.conn.SetDeadline(deadline); err != nil {
+		c.Close()
+		return 0, &tcpip.ErrConnectionRefused{}
+	}
+	if n, err := c.conn.Write(frame); err != nil || n != len(frame) {
+		c.Close()
 		return 0, &tcpip.ErrConnectionRefused{}
 	}
 	var v [1]byte
 	if _, err := io.ReadFull(c.conn, v[:]); err != nil {
-		c.failLocked()
+		c.Close()
 		return 0, &tcpip.ErrConnectionRefused{}
 	}
-	return v[0], nil
-}
-
-// failLocked marks the connection dead so every subsequent flow is denied — a
-// stale/late reply can never be misattributed to a later flow. Caller holds mu.
-func (c *egressGateClient) failLocked() {
-	c.dead = true
-	_ = c.conn.Close()
+	switch v[0] {
+	case egressGateVerdictDeny, egressGateVerdictAllow:
+		return v[0], nil
+	case egressGateVerdictNeedMore:
+		if kind == egressGateKindL7 {
+			return v[0], nil
+		}
+	}
+	// Unknown verdicts and need-more on TCP/UDP indicate a protocol mismatch.
+	// Never risk applying later bytes from this stream to a different flow.
+	c.Close()
+	return 0, &tcpip.ErrConnectionRefused{}
 }
 
 // egressGateIsLoopbackOrUnspecified reports whether a is a loopback (127/8,
 // ::1) or the unspecified address — traffic that never egresses.
 func egressGateIsLoopbackOrUnspecified(a tcpip.Address) bool {
+	if v4 := a.To4(); v4.Len() == 4 {
+		a = v4
+	}
 	switch a.Len() {
 	case 4:
 		b := a.As4()
@@ -789,10 +856,7 @@ func egressGateIsLoopbackOrUnspecified(a tcpip.Address) bool {
 		}
 		return b[15] == 1
 	default:
-		// Unknown address length: not a recognizable loopback, so do NOT
-		// exempt — fall through to the host gate (fail closed). Unreachable
-		// in practice (dst is always 4 or 16 bytes) but keeps the security
-		// contract consistent.
+		// Invalid addresses are rejected before marshalling a request.
 		return false
 	}
 }

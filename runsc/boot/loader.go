@@ -811,6 +811,11 @@ func New(args Args) (_ *Loader, retErr error) {
 	if creator != nil {
 		l.egressGate = creator.egressGate
 	}
+	defer func() {
+		if retErr != nil && l.egressGate != nil {
+			l.egressGate.Close()
+		}
+	}()
 	// Consume the donated ingress FD, if any. Serving starts in
 	// run(), once the root namespace is final: configured at boot, or
 	// loaded from the checkpoint at restore.
@@ -1072,6 +1077,11 @@ func createProcessArgs(id string, spec *specs.Spec, conf *config.Config, creds *
 // been closed. For that reason, this should NOT be called in a defer, because
 // a panic in a control server rpc would then hang forever.
 func (l *Loader) Destroy() {
+	// Release endpoint locks held by gate checks before joining operations
+	// that may need those locks during shutdown.
+	if l.egressGate != nil {
+		l.egressGate.Close()
+	}
 	if l.stopSignalForwarding != nil {
 		l.stopSignalForwarding()
 	}

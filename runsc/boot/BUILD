@@ -208,7 +208,10 @@ go_test(
 go_test(
     name = "egress_gate_test",
     size = "small",
-    srcs = ["egress_gate_test.go"],
+    srcs = [
+        "egress_gate_test.go",
+        "egress_transport_test.go",
+    ],
     library = ":boot",
     deps = [
         "//pkg/tcpip",
