@@ -9,6 +9,8 @@ go_library(
     name = "pinring",
     srcs = [
         "pinring.go",
+        "pinring_linux.go",
+        "pinring_stub.go",
         "pinring_unsafe.go",
     ],
     visibility = ["//:sandbox"],

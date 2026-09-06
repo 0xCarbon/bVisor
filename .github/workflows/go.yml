@@ -92,3 +92,11 @@ jobs:
           --test_env=PATH \
           --test_output=streamed \
           //pkg/lisafs:plain_go_import_test
+    - name: Darwin platform seam build
+      run: |
+        bazel build \
+          --platforms=@io_bazel_rules_go//go/toolchain:darwin_arm64 \
+          //pkg/fd //pkg/fdchannel //pkg/eventfd //pkg/seccomp \
+          //pkg/flipcall //pkg/memutil //pkg/sentry/hostmm \
+          //pkg/sentry/platform //pkg/sentry/platform/interrupt \
+          //pkg/sentry/platform/platforms

@@ -16,7 +16,8 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        sudo curl -fsSL -o /usr/local/bin/bazel \
-          https://github.com/bazelbuild/bazelisk/releases/download/v1.26.2/bazelisk-linux-amd64
-        sudo chmod +x /usr/local/bin/bazel
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/bazelisk" \
+          https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/bazelisk-linux-amd64
+        echo "5a408715e932c0250d28bd84555f12edbf70117de42f9181691c736eacc4a992  $RUNNER_TEMP/bazelisk" | sha256sum -c -
+        sudo install -m 0755 "$RUNNER_TEMP/bazelisk" /usr/local/bin/bazel
         bazel --version
