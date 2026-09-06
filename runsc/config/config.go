@@ -19,6 +19,7 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -491,6 +492,14 @@ type Config struct {
 	// Access to SharedRootDir grants the ability to identify sandboxes, but
 	// not to control them.
 	SharedRootDir string `flag:"shared-root"`
+}
+
+// Clone returns an independent configuration, retaining which flags were
+// explicitly set. Keep reference-valued fields independent when adding fields.
+func (c *Config) Clone() *Config {
+	copy := *c
+	copy.explicitlySet = maps.Clone(c.explicitlySet)
+	return &copy
 }
 
 // Validate checks that the Config is in a consistent state, e.g. that no

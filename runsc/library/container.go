@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/compat"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/sandbox"
 )
@@ -47,9 +48,12 @@ type Container struct {
 // ID returns the container's unique identifier.
 func (c *Container) ID() string { return c.cont.ID }
 
-// Spec returns the OCI spec the container runs. The spec is shared with the
-// underlying container; callers must not mutate it.
-func (c *Container) Spec() *specs.Spec { return c.cont.Spec }
+// Spec returns an independent copy of the OCI spec the container runs.
+func (c *Container) Spec() *specs.Spec { return copySpec(c.cont.Spec) }
+
+// Config returns an independent snapshot of this container's effective
+// configuration, including its OCI configuration annotations.
+func (c *Container) Config() *config.Config { return c.rt.Config() }
 
 // SandboxPid returns the PID of the sandbox (sentry) process, or -1 if it is
 // not running. It is the embedder's liveness probe for the sandbox itself.

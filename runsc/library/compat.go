@@ -38,12 +38,23 @@ func (r *Runtime) CompatKey(driver string) compat.Key {
 // checkCompatKey validates a recorded key against this host. It runs before
 // any sandbox is built; failures are *IncompatibleKey.
 func (r *Runtime) checkCompatKey(expected, driver string) error {
+	return r.compareCompatKey(expected, driver, true /* platformKnown */)
+}
+
+// compareCompatKey can reject build, CPU and driver mismatches before reading a
+// spec. The platform is checked again once the spec's annotations have selected
+// the effective configuration, always before creating a sandbox.
+func (r *Runtime) compareCompatKey(expected, driver string, platformKnown bool) error {
 	image, err := compat.Parse(expected)
 	if err != nil {
 		return fmt.Errorf("library: parsing expected compat key: %w", err)
 	}
 	host := r.CompatKey(driver)
-	if !host.Compatible(image) {
+	comparison := host
+	if !platformKnown {
+		comparison.Platform = image.Platform
+	}
+	if !comparison.Compatible(image) {
 		return &IncompatibleKey{Host: host, Image: image, Expected: expected}
 	}
 	return nil

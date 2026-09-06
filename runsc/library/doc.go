@@ -64,6 +64,17 @@
 // state-file layout. Runtime.Load adopts a container created earlier (by this
 // process or by a CLI invocation).
 //
+// # Configuration and specs
+//
+// Runtime.Config returns a snapshot of the base configuration. Create and fresh
+// Restore validate and normalize private spec copies, then apply configuration
+// annotations with the same override policy as the CLI. Each Container retains
+// that effective configuration across lifecycle calls. Load and existing-ID
+// Restore apply the saved spec's annotations to the runtime's base configuration.
+// Container.Config and Container.Spec return independent snapshots. Callers may
+// reuse an input spec after a call returns; they must not modify it during a call.
+// Compatibility checks use the platform selected by the effective configuration.
+//
 // # FD donation
 //
 // CreateOptions/RestoreOptions carry the wave-02 donation surface as

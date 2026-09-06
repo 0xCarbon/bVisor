@@ -9,6 +9,7 @@ go_library(
     name = "library",
     srcs = [
         "compat.go",
+        "configuration.go",
         "container.go",
         "doc.go",
         "errors.go",
@@ -27,6 +28,7 @@ go_library(
         "//runsc/flag",
         "//runsc/sandbox",
         "//runsc/specutils",
+        "@com_github_mohae_deepcopy//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
@@ -37,10 +39,13 @@ go_test(
     size = "small",
     srcs = [
         "api_test.go",
+        "configuration_isolation_test.go",
+        "configuration_test.go",
         "files_test.go",
     ],
     library = ":library",
     deps = [
+        "//runsc/config",
         "//runsc/container",
         "//runsc/sandbox",
         "//runsc/specutils",
@@ -53,6 +58,7 @@ go_test(
     name = "library_test",
     size = "large",
     srcs = [
+        "configuration_lifecycle_test.go",
         "ingress_test.go",
         "library_test.go",
         "ownership_test.go",

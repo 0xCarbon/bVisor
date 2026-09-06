@@ -28,6 +28,10 @@ import (
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
+func validAPISpec() *specs.Spec {
+	return &specs.Spec{Process: &specs.Process{Args: []string{"true"}}, Root: &specs.Root{Path: "/"}}
+}
+
 // Invalid IDs stop before privileged work, allowing the library's acquisition
 // and isolation contracts to be tested by ordinary external consumers.
 func TestCreateFailureRetainsDonations(t *testing.T) {
@@ -42,7 +46,7 @@ func TestCreateFailureRetainsDonations(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			opts := library.CreateOptions{ID: "invalid/id", Spec: &specs.Spec{}}
+			opts := library.CreateOptions{ID: "invalid/id", Spec: validAPISpec()}
 			switch name {
 			case "gofer":
 				opts.GoferIOFiles = []*os.File{f}
@@ -116,9 +120,9 @@ func TestDonationAcquisitionFailureRetainsEarlierFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = rt.Create(library.CreateOptions{ID: "invalid/id", Spec: &specs.Spec{}, GoferIOFiles: []*os.File{f, nil}})
-	if err == nil {
-		t.Fatal("accepted a nil gofer file")
+	_, err = rt.Create(library.CreateOptions{ID: "invalid/id", Spec: validAPISpec(), GoferIOFiles: []*os.File{f, nil}})
+	if err == nil || !strings.Contains(err.Error(), "file 1 is nil") {
+		t.Fatalf("did not reach partial donation acquisition: %v", err)
 	}
 	if _, err := f.Stat(); err != nil {
 		t.Fatalf("partial acquisition consumed an earlier file: %v", err)
@@ -140,7 +144,7 @@ func TestConcurrentRuntimeCreate(t *testing.T) {
 			defer wg.Done()
 			<-start
 			for j := 0; j < 1000; j++ {
-				if _, err := rt.Create(library.CreateOptions{ID: "invalid/id", Spec: &specs.Spec{}}); err == nil {
+				if _, err := rt.Create(library.CreateOptions{ID: "invalid/id", Spec: validAPISpec()}); err == nil {
 					t.Error("Create accepted an invalid ID")
 					return
 				}

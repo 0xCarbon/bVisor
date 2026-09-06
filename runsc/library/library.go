@@ -90,7 +90,7 @@ func New(opts Options) (*Runtime, error) {
 	// Build the config from flag-registration defaults, the same mechanism
 	// the CLI uses for an unparsed flag set (and testutil.TestConfig for
 	// tests): RegisterFlags installs every default, NewFromFlags snapshots
-	// them into a Config and validates it. No argv is parsed anywhere.
+	// them into a Config and validates it. Process arguments are never parsed.
 	fs := flag.NewFlagSet("runsc-library", flag.ContinueOnError)
 	config.RegisterFlags(fs)
 	conf, err := config.NewFromFlags(fs)
@@ -131,13 +131,13 @@ func New(opts Options) (*Runtime, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid runtime configuration: %w", err)
 	}
-	return &Runtime{conf: conf}, nil
+	return &Runtime{conf: conf.Clone()}, nil
 }
 
-// Config returns the runsc configuration this runtime was built with. The
-// returned config is shared: callers must not mutate it (copy first).
+// Config returns an independent snapshot of the runtime's base configuration.
+// Changes to the snapshot do not affect this runtime or its containers.
 func (r *Runtime) Config() *config.Config {
-	return r.conf
+	return r.conf.Clone()
 }
 
 // CreateOptions are the arguments for Runtime.Create: the library view of
@@ -146,7 +146,8 @@ type CreateOptions struct {
 	// ID is the container ID (required, validated by runsc).
 	ID string
 
-	// Spec is the OCI runtime spec (required).
+	// Spec is the OCI runtime spec (required). Create validates and normalizes
+	// a private copy and applies its configuration annotations as the CLI does.
 	Spec *specs.Spec
 
 	// BundleDir is the bundle directory the spec was read from; stored in
@@ -202,10 +203,14 @@ func (r *Runtime) Create(opts CreateOptions) (*Container, error) {
 	if opts.Spec == nil {
 		return nil, fmt.Errorf("library: Create requires a Spec")
 	}
+	rt, spec, bundle, err := r.prepareSpec(opts.Spec, opts.BundleDir)
+	if err != nil {
+		return nil, err
+	}
 	args := container.Args{
 		ID:                 opts.ID,
-		Spec:               opts.Spec,
-		BundleDir:          opts.BundleDir,
+		Spec:               spec,
+		BundleDir:          bundle,
 		ConsoleSocket:      opts.ConsoleSocket,
 		PIDFile:            opts.PIDFile,
 		UserLog:            opts.UserLog,
@@ -223,12 +228,12 @@ func (r *Runtime) Create(opts CreateOptions) (*Container, error) {
 	if err := donations.acquire(&args); err != nil {
 		return nil, fmt.Errorf("library: %w", err)
 	}
-	c, err := container.New(r.conf, args)
+	c, err := container.New(rt.conf, args)
 	if err != nil {
 		return nil, fmt.Errorf("library: creating container %q: %w", opts.ID, err)
 	}
 	donations.commit()
-	return &Container{rt: r, cont: c}, nil
+	return &Container{rt: rt, cont: c}, nil
 }
 
 // Load adopts an existing container from the runtime root directory (any
@@ -240,7 +245,7 @@ func (r *Runtime) Load(id string) (*Container, error) {
 	if err != nil {
 		return nil, fmt.Errorf("library: loading container %q: %w", id, err)
 	}
-	return &Container{rt: r, cont: c}, nil
+	return r.adopt(c)
 }
 
 // RestoreOptions are the arguments for Runtime.Restore: the library view of
@@ -252,9 +257,10 @@ type RestoreOptions struct {
 	// ImagePath is the checkpoint image directory (required).
 	ImagePath string
 
-	// Spec is the OCI spec for a fresh restored container. When nil it is
-	// read from BundleDir/config.json. Existing containers use their saved
-	// spec and do not need the bundle to remain available.
+	// Spec is the OCI spec for a fresh restored container. A private copy is
+	// validated and normalized, including its configuration annotations.
+	// When nil it is read from BundleDir/config.json. Existing containers use
+	// their saved spec and do not need the bundle to remain available.
 	Spec *specs.Spec
 
 	// BundleDir is the bundle directory for the spec (defaults to the
@@ -325,7 +331,7 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 		return nil, fmt.Errorf("library: Restore requires an ImagePath")
 	}
 	if opts.ExpectedCompatKey != "" {
-		if err := r.checkCompatKey(opts.ExpectedCompatKey, opts.Driver); err != nil {
+		if err := r.compareCompatKey(opts.ExpectedCompatKey, opts.Driver, false /* platformKnown */); err != nil {
 			return nil, err
 		}
 	}
@@ -337,7 +343,10 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 	// its spec read from a bundle.
 	c, err := container.Load(r.conf.RootDir, container.FullID{ContainerID: opts.ID}, container.LoadOpts{})
 	if err == nil {
-		lc := &Container{rt: r, cont: c}
+		lc, err := r.adopt(c)
+		if err != nil {
+			return nil, err
+		}
 		if err := lc.Restore(opts); err != nil {
 			return nil, err
 		}
@@ -365,10 +374,19 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 		opts.BundleDir = bundleDir
 	}
 
+	rt, spec, bundle, err := r.prepareSpec(spec, opts.BundleDir)
+	if err != nil {
+		return nil, err
+	}
+	if opts.ExpectedCompatKey != "" {
+		if err := rt.checkCompatKey(opts.ExpectedCompatKey, opts.Driver); err != nil {
+			return nil, err
+		}
+	}
 	args := container.Args{
 		ID:              opts.ID,
 		Spec:            spec,
-		BundleDir:       opts.BundleDir,
+		BundleDir:       bundle,
 		ConsoleSocket:   opts.ConsoleSocket,
 		PIDFile:         opts.PIDFile,
 		UserLog:         opts.UserLog,
@@ -385,11 +403,11 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 	if err := donations.acquire(&args); err != nil {
 		return nil, fmt.Errorf("library: %w", err)
 	}
-	c, err = container.New(r.conf, args)
+	c, err = container.New(rt.conf, args)
 	if err != nil {
 		return nil, fmt.Errorf("library: creating container %q for restore: %w", opts.ID, err)
 	}
-	lc := &Container{rt: r, cont: c}
+	lc := &Container{rt: rt, cont: c}
 	if err := lc.restore(opts); err != nil {
 		// Mirror the CLI cleanup: destroy the partially created container.
 		if derr := c.Destroy(); derr != nil {
