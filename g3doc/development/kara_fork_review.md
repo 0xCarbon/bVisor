@@ -179,3 +179,12 @@ regressions pass on systrap and KVM. The new lifecycle test starts a container
 with an annotated host network configuration, checks its normalized private
 root path, and verifies that Load retains the effective configuration while
 the caller's spec and the runtime's base configuration remain independent.
+
+### Malformed ingress frame regression stability
+
+CI exposed a timing bug in the oversized-length test: the relay correctly
+closed after reading the invalid length, while the test sometimes failed with
+EPIPE trying to write the unused body. Invalid-length cases now send only the
+prefix, verifying that rejection happens without waiting for a body. The
+malformed-frame regression passes 1,000 repetitions with the race detector,
+and the complete ingress test suite also passes with the race detector.
