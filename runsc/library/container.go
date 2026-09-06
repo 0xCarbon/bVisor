@@ -94,8 +94,9 @@ type CheckpointOptions struct {
 	CudaCheckpointPath       string
 	CudaCheckpointSequential bool
 
-	// SplitFSCheckpoint splits the filesystem checkpoint into a separate
-	// file; restore must then set RestoreOptions.SplitFSRestore.
+	// SplitFSCheckpoint is retained for source compatibility.
+	// Deprecated: upstream removed split filesystem checkpoints. Setting
+	// this field returns an error before writing any checkpoint files.
 	SplitFSCheckpoint bool
 
 	// SaveRestoreExecArgv/SaveRestoreExecTimeout configure the optional
@@ -131,6 +132,9 @@ type CheckpointResult struct {
 // IsSaveRejection/IsSandboxDeath aliases. errors.As works because this call
 // is in-process.
 func (c *Container) Checkpoint(opts CheckpointOptions) (*CheckpointResult, error) {
+	if opts.SplitFSCheckpoint {
+		return nil, fmt.Errorf("library: split filesystem checkpoint is no longer supported")
+	}
 	if opts.ImagePath == "" {
 		return nil, fmt.Errorf("library: checkpointing container %q: ImagePath is required", c.cont.ID)
 	}
@@ -151,7 +155,6 @@ func (c *Container) Checkpoint(opts CheckpointOptions) (*CheckpointResult, error
 		ExcludeCommittedZeroPages:  opts.ExcludeCommittedZeroPages,
 		CudaCheckpointPath:         opts.CudaCheckpointPath,
 		CudaCheckpointSequential:   opts.CudaCheckpointSequential,
-		SplitFSCheckpoint:          opts.SplitFSCheckpoint,
 		SaveRestoreExecArgv:        opts.SaveRestoreExecArgv,
 		SaveRestoreExecTimeout:     opts.SaveRestoreExecTimeout,
 		SaveRestoreExecContainerID: c.cont.ID,
@@ -174,6 +177,9 @@ func (c *Container) Checkpoint(opts CheckpointOptions) (*CheckpointResult, error
 // (call Destroy) — the library does not auto-destroy here, only
 // Runtime.Restore (the fresh-create path) cleans up on failure.
 func (c *Container) Restore(opts RestoreOptions) error {
+	if opts.SplitFSRestore {
+		return fmt.Errorf("library: split filesystem restore is no longer supported")
+	}
 	if opts.ImagePath == "" {
 		return fmt.Errorf("library: restoring container %q: ImagePath is required", c.cont.ID)
 	}
@@ -182,7 +188,7 @@ func (c *Container) Restore(opts RestoreOptions) error {
 			return err
 		}
 	}
-	if err := c.cont.Restore(c.rt.conf, opts.ImagePath, opts.Direct, opts.Background, opts.SplitFSRestore, nil /* networkArgs */); err != nil {
+	if err := c.cont.Restore(c.rt.conf, opts.ImagePath, opts.Direct, opts.Background, nil /* networkArgs */); err != nil {
 		return fmt.Errorf("library: restoring container %q from %q: %w", c.cont.ID, opts.ImagePath, err)
 	}
 	return nil

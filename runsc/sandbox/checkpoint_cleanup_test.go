@@ -107,11 +107,9 @@ func TestRemoveLocalSaveFiles(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		compression statefile.CompressionLevel
-		splitFS     bool
 	}{
-		{"none", statefile.CompressionLevelNone, false},
-		{"flate-best-speed", statefile.CompressionLevelFlateBestSpeed, false},
-		{"none-splitfs", statefile.CompressionLevelNone, true},
+		{"none", statefile.CompressionLevelNone},
+		{"flate-best-speed", statefile.CompressionLevelFlateBestSpeed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -120,40 +118,18 @@ func TestRemoveLocalSaveFiles(t *testing.T) {
 				want[checkpointfiles.PagesMetadataFileName] = false
 				want[checkpointfiles.PagesFileName] = false
 			}
-			fsDir := filepath.Join(dir, "fs")
-			if tc.splitFS {
-				want[checkpointfiles.PagesMetadataFileName] = false // fs copy
-				want[checkpointfiles.PagesFileName] = false         // fs copy
-				if err := os.MkdirAll(fsDir, 0755); err != nil {
-					t.Fatalf("MkdirAll: %v", err)
-				}
+			// A filesystem snapshot belongs to the caller, not this checkpoint.
+			// It must survive alongside unrelated top-level files.
+			want[filepath.Join("fs", checkpointfiles.PagesFileName)] = true
+			if err := os.Mkdir(filepath.Join(dir, "fs"), 0755); err != nil {
+				t.Fatalf("Mkdir: %v", err)
 			}
-			// Create all candidate files.
 			for name := range want {
-				p := filepath.Join(dir, name)
-				if tc.splitFS && (name == checkpointfiles.PagesMetadataFileName || name == checkpointfiles.PagesFileName) {
-					// The split-FS variants live under fs/.
-					want[filepath.Join("fs", name)] = want[name]
-					delete(want, name)
-					p = filepath.Join(fsDir, name)
-				}
-				if err := os.WriteFile(p, []byte("stub"), 0644); err != nil {
-					t.Fatalf("WriteFile(%q): %v", p, err)
+				if err := os.WriteFile(filepath.Join(dir, name), []byte("stub"), 0644); err != nil {
+					t.Fatalf("WriteFile(%q): %v", name, err)
 				}
 			}
-			if tc.splitFS {
-				// Also the split-FS-only files.
-				for _, name := range []string{checkpointfiles.FSCheckpointManifestFileName, checkpointfiles.FSCheckpointMultiTarFileName} {
-					if err := os.WriteFile(filepath.Join(fsDir, name), []byte("stub"), 0644); err != nil {
-						t.Fatalf("WriteFile: %v", err)
-					}
-				}
-			}
-
 			opts := CheckpointOpts{Compression: tc.compression}
-			if tc.splitFS {
-				opts.SplitFSCheckpoint = true
-			}
 			if err := removeLocalSaveFiles(dir, opts); err != nil {
 				t.Fatalf("removeLocalSaveFiles: %v", err)
 			}

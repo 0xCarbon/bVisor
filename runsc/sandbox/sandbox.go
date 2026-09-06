@@ -69,7 +69,6 @@ import (
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/starttime"
-	"gvisor.dev/gvisor/runsc/version"
 
 	metricpb "gvisor.dev/gvisor/pkg/metric/metric_go_proto"
 )
@@ -327,6 +326,10 @@ type Args struct {
 	// open filesystem checkpoint files using O_DIRECT.
 	FSRestoreImagePath string
 	FSRestoreDirect    bool
+
+	// PinRingFile, if non-nil, is the pin ring to donate to the boot
+	// process (see `//pkg/pinring`).
+	PinRingFile *os.File
 }
 
 // New creates the sandbox process. The caller must call Destroy() on the
@@ -542,7 +545,7 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 }
 
 // Restore sends the restore call for a container in the sandbox.
-func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, direct, background, splitFSRestore bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
+func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, direct, background bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
 	if err := hostsettings.Handle(conf); err != nil {
 		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
 	}
@@ -550,8 +553,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
 
 	opt := boot.RestoreOpts{
-		Background:     background,
-		SplitFSRestore: splitFSRestore,
+		Background: background,
 	}
 	defer func() {
 		for _, f := range opt.FilePayload.Files {
@@ -963,8 +965,10 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if p, err := sentryBin.Path(); err == nil {
 		log.Infof("Sidecar %q found: booting sandbox with %s", sentryBin.Name, p)
 		bootBinPath = p
+	} else if conf.SidecarUsagePolicy.AllowEmbeddedFallback() {
+		sentryBin.WarnUnavailable(fmt.Sprintf("Sidecar %q not usable (%v): booting sandbox with runsc itself", sentryBin.Name, err))
 	} else {
-		log.Warningf("Sidecar %q not usable (%v): booting sandbox with runsc itself", sentryBin.Name, err)
+		return fmt.Errorf("sidecar %q not usable (%v) and --sidecar-usage-policy is set to STRICT", sentryBin.Name, err)
 	}
 
 	// Relay all the config flags to the sandbox process.
@@ -988,8 +992,10 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		log.Infof("Sidecar %q found: prepending Sentry boot command with %s", gvisorbinaries.GvisorSentryPrewarmer.Name, p)
 		cmd.Args = append([]string{p, cmd.Path}, cmd.Args[0:]...)
 		cmd.Path = p
+	} else if conf.SidecarUsagePolicy != config.SidecarUsageStrict {
+		gvisorbinaries.GvisorSentryPrewarmer.WarnUnavailable(fmt.Sprintf("Sidecar %q not found or usable (%v). This slows down gVisor startup significantly", gvisorbinaries.GvisorSentryPrewarmer.Name, err))
 	} else {
-		log.Warningf("Sidecar %q not found or usable (%v). This slows down gVisor startup significantly.", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
+		return fmt.Errorf("sidecar %q not usable (%v) and --sidecar-usage-policy is set to STRICT", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
 	}
 
 	// Transfer FDs that need to be present before the "boot" command.
@@ -1027,6 +1033,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	donations.DonateAndClose("gofer-filestore-fds", args.GoferFilestoreFiles...)
 	donations.DonateAndClose("mounts-fd", args.MountsFile)
 	donations.Donate("start-sync-fd", startSyncFile)
+	donations.DonateAndClose("pin-ring-fd", args.PinRingFile)
 	if err := donations.DonateLogFile("user-log-fd", args.UserLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, lfOpts); err != nil {
 		return err
 	}
@@ -1661,7 +1668,6 @@ type CheckpointOpts struct {
 	ExcludeCommittedZeroPages bool
 	CudaCheckpointPath        string
 	CudaCheckpointSequential  bool
-	SplitFSCheckpoint         bool
 
 	// Save/restore exec options.
 	SaveRestoreExecArgv        string
@@ -1674,22 +1680,12 @@ type CheckpointOpts struct {
 func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, opts CheckpointOpts) error {
 	log.Debugf("Checkpoint sandbox %q, imagePath %q, opts %+v", s.ID, imagePath, opts)
 
-	if opts.SplitFSCheckpoint {
-		// Verify we are not using GCS/gofer.
-		gcsOptsPath := path.Join(imagePath, checkpointGCSOptsFileName)
-		if _, err := os.Stat(gcsOptsPath); err == nil {
-			return fmt.Errorf("split filesystem checkpoint is not supported with GCS/gofer")
-		}
-	}
-
 	opt := control.SaveOpts{
 		Metadata:                       opts.Compression.ToMetadata(),
 		AppMFExcludeCommittedZeroPages: opts.ExcludeCommittedZeroPages,
 		Resume:                         opts.Resume,
 		CudaCheckpointPath:             opts.CudaCheckpointPath,
 		CudaCheckpointSequential:       opts.CudaCheckpointSequential,
-		SplitFSCheckpoint:              opts.SplitFSCheckpoint,
-		RunscVersion:                   version.Version(),
 		ExecOpts: control.SaveRestoreExecOpts{
 			Argv:        opts.SaveRestoreExecArgv,
 			Timeout:     opts.SaveRestoreExecTimeout,
@@ -1729,7 +1725,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 }
 
 // removeLocalSaveFiles removes the checkpoint image files that
-// createSaveFiles() (and the split-filesystem variant) created in imagePath.
+// createSaveFiles() created in imagePath.
 //
 // Precondition: the corresponding setCheckpointOptsFilesForLocalCheckpoint()
 // call succeeded, which used O_EXCL to create these files; therefore they were
@@ -1745,17 +1741,6 @@ func removeLocalSaveFiles(imagePath string, opts CheckpointOpts) error {
 		if err := os.Remove(filepath.Join(imagePath, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, err)
 		}
-	}
-	if opts.SplitFSCheckpoint {
-		fsImagePath := filepath.Join(imagePath, "fs")
-		for _, name := range []string{checkpointfiles.FSCheckpointManifestFileName, checkpointfiles.FSCheckpointMultiTarFileName, checkpointfiles.PagesMetadataFileName, checkpointfiles.PagesFileName} {
-			if err := os.Remove(filepath.Join(fsImagePath, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				errs = append(errs, err)
-			}
-		}
-		// Best-effort removal of the fs directory itself; it may fail if the
-		// checkpoint gofer wrote extra bookkeeping there.
-		_ = os.Remove(fsImagePath)
 	}
 	return errors.Join(errs...)
 }
@@ -1782,31 +1767,6 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
 	}
 	opt.FilePayload.Files = files
 	opt.HavePagesFile = len(files) > 1
-
-	if opts.SplitFSCheckpoint {
-		fsImagePath := filepath.Join(imagePath, "fs")
-		if err := os.MkdirAll(fsImagePath, 0755); err != nil {
-			return fmt.Errorf("creating fs checkpoint directory: %w", err)
-		}
-		fsFiles, err := openFSCheckpointLocalFiles(fsImagePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, opts.Direct)
-		if err != nil {
-			for _, f := range files {
-				_ = f.Close()
-			}
-			// openFSCheckpointLocalFiles removes its own partial creations
-			// under fs/. Remove only the top-level files THIS function
-			// created (createSaveFiles above), not removeLocalSaveFiles —
-			// the split-FS open may have failed because the fs/ directory
-			// already contained files we do not own, and deleting those
-			// would destroy a pre-existing checkpoint.
-			for _, f := range files {
-				_ = os.Remove(f.Name())
-			}
-			_ = os.Remove(fsImagePath)
-			return fmt.Errorf("creating fs checkpoint files: %w", err)
-		}
-		opt.FilePayload.Files = append(opt.FilePayload.Files, fsFiles...)
-	}
 	return nil
 }
 

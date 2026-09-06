@@ -275,7 +275,9 @@ type RestoreOptions struct {
 	Direct     bool
 	Background bool
 
-	// SplitFSRestore restores from a split filesystem checkpoint.
+	// SplitFSRestore is retained for source compatibility.
+	// Deprecated: upstream removed split filesystem checkpoints. Setting
+	// this field returns an error before creating or adopting a container.
 	SplitFSRestore bool
 
 	// GoferIOFiles, EgressFile, PassFiles and ExecFile are the restore-side
@@ -311,6 +313,9 @@ type RestoreOptions struct {
 // exists in the root it is reused, otherwise a fresh one is created from the
 // spec; the image is then loaded and the application resumed.
 func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
+	if opts.SplitFSRestore {
+		return nil, fmt.Errorf("library: split filesystem restore is no longer supported")
+	}
 	if opts.ImagePath == "" {
 		return nil, fmt.Errorf("library: Restore requires an ImagePath")
 	}
@@ -356,18 +361,16 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 	}
 
 	args := container.Args{
-		ID:                opts.ID,
-		Spec:              spec,
-		BundleDir:         opts.BundleDir,
-		ConsoleSocket:     opts.ConsoleSocket,
-		PIDFile:           opts.PIDFile,
-		UserLog:           opts.UserLog,
-		Attached:          opts.Attached,
-		PassFiles:         opts.PassFiles,
-		ExecFile:          opts.ExecFile,
-		FSRestoreDirect:   opts.Direct,
-		CheckpointDirPath: opts.ImagePath,
-		SplitFSRestore:    opts.SplitFSRestore,
+		ID:              opts.ID,
+		Spec:            spec,
+		BundleDir:       opts.BundleDir,
+		ConsoleSocket:   opts.ConsoleSocket,
+		PIDFile:         opts.PIDFile,
+		UserLog:         opts.UserLog,
+		Attached:        opts.Attached,
+		PassFiles:       opts.PassFiles,
+		ExecFile:        opts.ExecFile,
+		FSRestoreDirect: opts.Direct,
 	}
 	ioFDs, err := fileFDs(opts.GoferIOFiles)
 	if err != nil {
