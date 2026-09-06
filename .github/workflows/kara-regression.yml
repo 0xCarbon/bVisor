@@ -3,7 +3,7 @@
 # Jobs:
 #   unit          - every bazel-visible test target the fork added or
 #                   changed over waves 01-06 (unprivileged).
-#   container-root- the root-required container regression subset plus the
+#   container-root- command tests, the container regression subset, and the
 #                   runsc/library reference embedder suite, run as root
 #                   against a bazel-built release via the validated
 #                   _main runfiles layout (tools/kara_regression.sh), on
@@ -68,19 +68,15 @@ jobs:
           set -euo pipefail
           # Waves 01-06 fork-added test surface that bazel can run
           # unprivileged. The root-required subset lives in container-root.
-          # Note: runsc/cmd re-executes itself through a user namespace at
-          # TestMain (MaybeRunAsRoot); hardened self-hosted runners that
-          # deny exec of /proc/self/exe inside user namespaces will fail
-          # there - that is an environment restriction, not a regression
-          # (reproduces on such hosts at master too).
-          bazel test \
+          # runsc/cmd also runs there: its TestMain needs root, and hosted
+          # runners restrict unprivileged user namespace creation.
+          bazel test --test_output=errors \
             //pkg/flipcall:flipcall_layout_test \
             //pkg/hostifc:hostifc_test \
             //pkg/lisafs:abi_conformance_test \
             //pkg/lisafs:fuzz_test \
             //pkg/tcpip/tests/integration:egress_gate_test \
             //runsc/boot:egress_gate_test \
-            //runsc/cmd:cmd_test \
             //runsc/compat:compat_test \
             //runsc/fsgofer:lisafs_test \
             //runsc/sandbox:sandbox_test

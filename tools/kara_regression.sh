@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# kara_regression.sh runs the fork's root-required container regression
-# suite (waves 01-06) against a bazel-built release, including sidecars.
+# kara_regression.sh runs the fork's command, container, and library
+# regression suites against a bazel-built release, including sidecars.
 #
 # The container test binaries need two things bazel's sandbox does not
 # provide: root (sandboxes, cgroups, PID namespaces) and a runsc binary in
@@ -58,17 +58,22 @@ mkdir -p "${WORK}"
 echo "==> workspace: ${WORK}"
 
 echo "==> building release and test binaries (bazel)"
-bazel build //:release //runsc/container:container_test //runsc/library:library_test
+bazel build //:release //runsc/cmd:cmd_test //runsc/container:container_test //runsc/library:library_test
 
 echo "==> laying out the _main runfiles shape"
 mkdir -p "${WORK}/rt/_main/release"
 cp -a bazel-bin/release/. "${WORK}/rt/_main/release/"
+cp -f bazel-bin/runsc/cmd/cmd_test_/cmd_test "${WORK}/cmd.test"
 cp -f bazel-bin/runsc/container/container_test_/container_test "${WORK}/container.test"
 cp -f bazel-bin/runsc/library/library_test_/library_test "${WORK}/library.test"
-chmod +x "${WORK}"/container.test "${WORK}"/library.test
+chmod +x "${WORK}"/cmd.test "${WORK}"/container.test "${WORK}"/library.test
 
 mkdir -p "${WORK}/tmp"
 cd "${WORK}/rt/_main"
+
+echo "==> command regression suite"
+sudo env TEST_TMPDIR="${WORK}/tmp" \
+  "${WORK}/cmd.test" -test.v -test.timeout 1200s
 
 echo "==> container regression subset (platforms: ${PLATFORMS})"
 sudo env TEST_TMPDIR="${WORK}/tmp" \
