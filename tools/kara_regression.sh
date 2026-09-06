@@ -55,6 +55,9 @@ cd "${REPO_ROOT}"
 
 WORK="${TMPDIR_ARG:-$(mktemp -d /tmp/kara-regression.XXXXXX)}"
 mkdir -p "${WORK}"
+# The non-DirectFS posture tests exec runsc as nobody. mktemp defaults to
+# mode 0700; allow traversal to the release without exposing directory listings.
+chmod a+x "${WORK}"
 echo "==> workspace: ${WORK}"
 
 echo "==> building release and test binaries (bazel)"
