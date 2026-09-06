@@ -234,16 +234,41 @@ type Args struct {
 	// Re-donated to the sandbox (Oca #447).
 	EgressFD *int
 
-	// IngressFD is the optional AF_UNIX FD to the Oca host-ingress relay. A
-	// nil pointer disables the data path; an explicit descriptor 0 remains
-	// valid. Re-donated to the sandbox (Oca #541).
+	// IngressFD is the optional host-ingress Unix stream descriptor.
+	// Deprecated: use IngressFile. Cannot be set together with IngressFile.
 	IngressFD *int
+
+	// IngressFile is the host-ingress Unix stream socket. New takes ownership
+	// on every return. Valid only for the root container of a new sandbox.
+	IngressFile *os.File
 }
 
 // New creates the container in a new Sandbox process, unless the metadata
 // indicates that an existing Sandbox should be used. The caller must call
 // Destroy() on the container.
 func New(conf *config.Config, args Args) (*Container, error) {
+	if args.IngressFile != nil {
+		defer args.IngressFile.Close()
+	}
+	if args.IngressFD != nil {
+		if args.IngressFile != nil {
+			return nil, fmt.Errorf("IngressFD and IngressFile cannot both be set")
+		}
+		if *args.IngressFD < 0 {
+			return nil, fmt.Errorf("invalid ingress FD %d", *args.IngressFD)
+		}
+		args.IngressFile = os.NewFile(uintptr(*args.IngressFD), "ingress-fd")
+		defer args.IngressFile.Close()
+	}
+	if args.IngressFile != nil {
+		fd := int(args.IngressFile.Fd())
+		if err := boot.ValidateIngressFD(conf, &fd); err != nil {
+			return nil, err
+		}
+		if !specutils.IsRootContainer(args.Spec) {
+			return nil, fmt.Errorf("ingress donation requires a root container")
+		}
+	}
 	log.Debugf("Create container, cid: %s, rootDir: %q", args.ID, conf.RootDir)
 	if err := validateID(args.ID); err != nil {
 		return nil, err
@@ -419,10 +444,6 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		if args.EgressFD != nil {
 			egressFile = os.NewFile(uintptr(*args.EgressFD), "oca-egress-fd")
 		}
-		var ingressFile *os.File
-		if args.IngressFD != nil {
-			ingressFile = os.NewFile(uintptr(*args.IngressFD), "oca-ingress-fd")
-		}
 		sandArgs := &sandbox.Args{
 			ID:                  sandboxID,
 			Spec:                args.Spec,
@@ -431,7 +452,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			UserLog:             args.UserLog,
 			IOFiles:             ioFiles,
 			EgressFile:          egressFile,
-			IngressFile:         ingressFile,
+			IngressFile:         args.IngressFile,
 			DevIOFile:           devIOFile,
 			MountsFile:          specFile,
 			Cgroup:              containerCgroup,
@@ -505,10 +526,22 @@ func (c *Container) Start(conf *config.Config) error {
 // Restore takes a container and replaces its kernel and file system
 // to restore a container from its state file.
 func (c *Container) Restore(conf *config.Config, imagePath string, direct, background bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
+	return c.RestoreWithOptions(conf, RestoreOptions{ImagePath: imagePath, Direct: direct, Background: background, NetworkArgs: networkArgs})
+}
+
+// RestoreOptions configures checkpoint restore, including fresh FD donations.
+type RestoreOptions = sandbox.RestoreOptions
+
+// RestoreWithOptions restores a container, borrowing opts.IngressFile for the
+// duration of the call. A fresh ingress socket replaces any create-time socket.
+func (c *Container) RestoreWithOptions(conf *config.Config, opts RestoreOptions) error {
 	log.Debugf("Restore container, cid: %s", c.ID)
+	if opts.IngressFile != nil && !specutils.IsRootContainer(c.Spec) {
+		return fmt.Errorf("ingress donation requires a root container")
+	}
 
 	restore := func(conf *config.Config, spec *specs.Spec) error {
-		return c.Sandbox.Restore(conf, spec, c.ID, imagePath, direct, background, networkArgs)
+		return c.Sandbox.RestoreWithOptions(conf, spec, c.ID, opts)
 	}
 	return c.startImpl(conf, "restore", restore, c.Sandbox.RestoreSubcontainer)
 }

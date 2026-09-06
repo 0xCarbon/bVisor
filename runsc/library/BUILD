@@ -34,7 +34,10 @@ go_library(
 go_test(
     name = "library_test",
     size = "large",
-    srcs = ["library_test.go"],
+    srcs = [
+        "ingress_test.go",
+        "library_test.go",
+    ],
     data = ["//:release"],
     library = ":library",
     deps = [
@@ -42,6 +45,7 @@ go_test(
         "//pkg/sentry/control",
         "//pkg/state/statefile",
         "//pkg/test/testutil",
+        "//runsc/boot/ingress",
         "//runsc/compat",
         "//runsc/config",
         "//runsc/flag",

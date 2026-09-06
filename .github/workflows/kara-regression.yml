@@ -77,10 +77,28 @@ jobs:
             //pkg/lisafs:fuzz_test \
             //pkg/tcpip/tests/integration:egress_gate_test \
             //runsc/boot:egress_gate_test \
+            //runsc/boot:ingress_seam_test \
+            //runsc/boot/ingress:ingress_test \
             //runsc/cmd/alias/bwrap:bwrap_test \
             //runsc/compat:compat_test \
             //runsc/fsgofer:lisafs_test \
             //runsc/sandbox:sandbox_test
+
+  ingress-race:
+    name: ingress relay race and fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Exercise relay lifecycle and malformed frames
+        run: |
+          go test -race ./runsc/boot/ingress -count=5
+          go test ./runsc/boot/ingress -run='^$' -fuzz=FuzzFrames -fuzztime=20s -parallel=2
 
   container-root:
     name: container regression (root, ${{ matrix.platform }})

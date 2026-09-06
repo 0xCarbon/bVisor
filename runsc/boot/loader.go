@@ -228,12 +228,10 @@ type Loader struct {
 	// via stack.CtxEgressGate so the gate survives checkpoint/restore.
 	egressGate *egressGateClient
 
-	// ingressRelay is the host-ingress relay built from the donated
-	// --ingress-fd during New. Serving starts when the kernel runs (run),
-	// so a restored kernel dials through the loaded netstack rather than
-	// the pre-restore empty one. The relay ends when the host closes the
-	// conn (checkpoint/stop teardown); restore re-donates a fresh FD
-	// (Oca #541).
+	// ingressRelay serves the donated socket once the kernel runs. Each dial
+	// resolves the current root netstack, including after restore replaces k.
+	// It is joined before kernel release. Restore may replace a create-time
+	// socket with a fresh donation while the loader is still created.
 	ingressRelay *ingress.Relay
 
 	// ctrl is the control server.
@@ -454,10 +452,10 @@ type Args struct {
 	// pointer disables the data path; an explicit descriptor 0 remains valid.
 	// The Loader takes ownership (Oca #447).
 	EgressFD *int
-	// IngressFD is the optional AF_UNIX FD to the Oca host-ingress relay. A
+	// IngressFD is the optional AF_UNIX FD to the host-ingress relay. A
 	// nil pointer disables the data path; an explicit descriptor 0 remains
 	// valid. The Loader takes ownership and serves the relay against the
-	// sandbox netstack once the root namespace is final (Oca #541).
+	// sandbox netstack once the root namespace is final.
 	IngressFD *int
 	// GoferFilestoreFDs are FDs to the regular files that will back the tmpfs or
 	// overlayfs mount for certain gofer mounts.
@@ -600,7 +598,7 @@ func shouldEnableClockMonotonicRaw(spec *specs.Spec, conf *config.Config) bool {
 
 // New initializes a new kernel loader configured by spec.
 // New also handles setting up a kernel for restoring a container.
-func New(args Args) (*Loader, error) {
+func New(args Args) (_ *Loader, retErr error) {
 	stopProfilingRuntime := profile.Start(args.ProfileOpts)
 	stopProfiling := func() {
 		stopProfilingRuntime()
@@ -801,9 +799,8 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("getting root credentials")
 	}
 	// The ingress relay must fail closed: reject any configuration with no
-	// sandbox netstack to serve, instead of hanging the donating host
-	// (Oca #541).
-	if err := validateIngressFD(args.Conf, args.IngressFD); err != nil {
+	// sandbox netstack to serve, instead of hanging the donating host.
+	if err := ValidateIngressFD(args.Conf, args.IngressFD); err != nil {
 		return nil, err
 	}
 	// Create root network namespace/stack.
@@ -814,15 +811,20 @@ func New(args Args) (*Loader, error) {
 	if creator != nil {
 		l.egressGate = creator.egressGate
 	}
-	// Consume the donated ingress FD, if any (Oca #541). Serving starts in
+	// Consume the donated ingress FD, if any. Serving starts in
 	// run(), once the root namespace is final: configured at boot, or
 	// loaded from the checkpoint at restore.
 	if args.IngressFD != nil {
-		relay, err := newIngressRelay(*args.IngressFD, l.k)
+		relay, err := newIngressRelay(*args.IngressFD, func() *kernel.Kernel { return l.k })
 		if err != nil {
-			return nil, fmt.Errorf("oca ingress relay: %w", err)
+			return nil, fmt.Errorf("ingress relay: %w", err)
 		}
 		l.ingressRelay = relay
+		defer func() {
+			if retErr != nil {
+				relay.Close()
+			}
+		}()
 	}
 	args.StartupTimer.Reached("network stack created")
 
@@ -1095,6 +1097,11 @@ func (l *Loader) Destroy() {
 	// long-running control operations that are in flight, e.g.
 	// profiling operations.
 	l.ctrl.stop()
+
+	// Join ingress dials and IO before releasing the kernel they reference.
+	if l.ingressRelay != nil {
+		l.ingressRelay.Close()
+	}
 
 	// Release all kernel resources. This is only safe after we can no longer
 	// save/restore.
@@ -1382,14 +1389,12 @@ func (l *Loader) run() error {
 	})
 	l.startupTimer.Reached("signal forwarding started")
 
-	// Oca host-ingress relay (#541): the root namespace is final here, so
-	// serve the donated FD against it. The relay lives until the host
-	// closes the conn (checkpoint/stop teardown; restore re-donates a
-	// fresh FD alongside the fresh gofer/egress FDs).
+	// The root namespace is final. Start serving the donated socket; dials
+	// resolve this kernel's stack even when New preceded a restore.
 	if l.ingressRelay != nil {
 		go func() {
 			if err := l.ingressRelay.Serve(); err != nil {
-				log.Warningf("oca ingress relay: %v", err)
+				log.Warningf("ingress relay: %v", err)
 			}
 		}()
 	}

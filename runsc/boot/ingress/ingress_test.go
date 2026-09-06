@@ -16,6 +16,7 @@ package ingress
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -130,12 +131,12 @@ func serveRelay(t *testing.T, donated net.Conn, dial Dialer) (done chan error, f
 // tcpDialer returns a Dialer that connects to a host TCP address, unmapping
 // the v4-in-v6 wire form the way a real guest dial would.
 func tcpDialer(addr netip.AddrPort) Dialer {
-	return func(target [16]byte, port uint16) (net.Conn, error) {
+	return func(ctx context.Context, target [16]byte, port uint16) (net.Conn, error) {
 		got := netip.AddrPortFrom(netip.AddrFrom16(target).Unmap(), port)
 		if got != addr {
 			return nil, fmt.Errorf("unexpected dial target %v, want %v", got, addr)
 		}
-		return net.Dial("tcp", got.String())
+		return (&net.Dialer{}).DialContext(ctx, "tcp", got.String())
 	}
 }
 
@@ -271,6 +272,10 @@ func TestRelayEndToEnd(t *testing.T) {
 	// guest side would see EOF; verify via the EOT path instead: send CLOSE
 	// and expect the guest connection to be torn down (next echo conn ends).
 	writeAll(t, host, MarshalClose(1))
+	kind, id, _ = readFrame(t, host)
+	if kind != KindClose || id != 1 {
+		t.Fatalf("teardown: kind=%d id=%d, want CLOSE(id=1)", kind, id)
+	}
 
 	// Frames for an unknown (already-closed) id are dropped, not fatal.
 	writeAll(t, host, MarshalData(99, []byte("stray")))
@@ -291,7 +296,7 @@ func TestRelayEndToEnd(t *testing.T) {
 // DIAL_RESULT(refused) followed by CLOSE, and the relay stays healthy.
 func TestGuestDialRefused(t *testing.T) {
 	host, donated := socketPair(t)
-	_, _ = serveRelay(t, donated, func([16]byte, uint16) (net.Conn, error) {
+	_, _ = serveRelay(t, donated, func(context.Context, [16]byte, uint16) (net.Conn, error) {
 		return nil, errors.New("guest loopback refused")
 	})
 
@@ -317,7 +322,7 @@ func TestGuestDialRefused(t *testing.T) {
 // protocol version tears the relay down instead of misparsing the frame.
 func TestVersionMismatchFailsClosed(t *testing.T) {
 	host, donated := socketPair(t)
-	done, _ := serveRelay(t, donated, func([16]byte, uint16) (net.Conn, error) {
+	done, _ := serveRelay(t, donated, func(context.Context, [16]byte, uint16) (net.Conn, error) {
 		t.Error("dialer must not run for a rejected frame")
 		return nil, errors.New("unreachable")
 	})
@@ -373,6 +378,14 @@ func TestMalformedFramesFailClosed(t *testing.T) {
 			frame: withLen([]byte{Version, KindClose, 0, 0, 0}),
 		},
 		{
+			name:  "oversized DATA payload",
+			frame: MarshalData(1, make([]byte, MaxDataChunk+1)),
+		},
+		{
+			name:  "unexpected dial result",
+			frame: MarshalDialResult(1, DialOK),
+		},
+		{
 			name:  "short OPEN frame",
 			frame: withLen([]byte{Version, KindOpen, 0, 0, 0, 1, 1, 2, 3}),
 		},
@@ -380,7 +393,7 @@ func TestMalformedFramesFailClosed(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			host, donated := socketPair(t)
-			done, _ := serveRelay(t, donated, func([16]byte, uint16) (net.Conn, error) {
+			done, _ := serveRelay(t, donated, func(context.Context, [16]byte, uint16) (net.Conn, error) {
 				t.Error("dialer must not run for a rejected frame")
 				return nil, errors.New("unreachable")
 			})
@@ -430,10 +443,11 @@ func TestBackpressureStallsUpstream(t *testing.T) {
 	stalled := make(chan struct{})
 	var once sync.Once
 	host, donated := socketPair(t)
-	_, _ = serveRelay(t, donated, func([16]byte, uint16) (net.Conn, error) {
+	_, _ = serveRelay(t, donated, func(context.Context, [16]byte, uint16) (net.Conn, error) {
 		a, b := net.Pipe()
 		once.Do(func() { close(guestReady) })
 		go func() {
+			defer a.Close()
 			buf := make([]byte, 64*1024)
 			n, _ := a.Read(buf)
 			received.Add(int64(n))
@@ -498,12 +512,14 @@ func TestTeardownClosesGuestConns(t *testing.T) {
 func TestStallThenHostCloseEndsRelay(t *testing.T) {
 	guestReady := make(chan struct{})
 	stalled := make(chan struct{})
+	defer close(stalled)
 	var once sync.Once
 	host, donated := socketPair(t)
-	_, finished := serveRelay(t, donated, func([16]byte, uint16) (net.Conn, error) {
+	_, finished := serveRelay(t, donated, func(context.Context, [16]byte, uint16) (net.Conn, error) {
 		a, b := net.Pipe()
 		once.Do(func() { close(guestReady) })
 		go func() {
+			defer a.Close()
 			buf := make([]byte, 64*1024)
 			_, _ = a.Read(buf)
 			<-stalled // stall forever: the queue fills, the mux parks
@@ -545,7 +561,7 @@ func TestStallThenHostCloseEndsRelay(t *testing.T) {
 // end closes the donated conn (checkpoint/stop teardown; restore re-donates).
 func TestServeReturnsOnConnClose(t *testing.T) {
 	host, donated := socketPair(t)
-	done, _ := serveRelay(t, donated, func([16]byte, uint16) (net.Conn, error) {
+	done, _ := serveRelay(t, donated, func(context.Context, [16]byte, uint16) (net.Conn, error) {
 		return nil, errors.New("unreachable")
 	})
 	_ = host.Close()
@@ -556,5 +572,30 @@ func TestServeReturnsOnConnClose(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not return after conn close")
+	}
+}
+
+// A read EOF from the guest is only a half-close: the host must still be able
+// to send its remaining request before closing its own write direction.
+func TestGuestHalfCloseKeepsHostWriteOpen(t *testing.T) {
+	service, guest := socketPair(t)
+	host, donated := socketPair(t)
+	serveRelay(t, donated, func(context.Context, [16]byte, uint16) (net.Conn, error) { return guest, nil })
+	writeAll(t, host, MarshalOpen(1, loopback16(), 8080))
+	readFrame(t, host)
+	if err := service.(*net.UnixConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	kind, _, _ := readFrame(t, host)
+	if kind != KindCloseWrite {
+		t.Fatalf("kind = %d, want CLOSE_WRITE", kind)
+	}
+	want := []byte("request after guest EOF")
+	writeAll(t, host, MarshalData(1, want))
+	writeAll(t, host, MarshalCloseWrite(1))
+	service.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got, err := io.ReadAll(service)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("guest received %q, %v; want %q", got, err, want)
 	}
 }

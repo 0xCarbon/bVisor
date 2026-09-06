@@ -15,7 +15,6 @@
 package boot
 
 import (
-	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -31,10 +30,8 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
-	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
 	"gvisor.dev/gvisor/pkg/tcpip/link/loopback"
@@ -46,7 +43,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/urpc"
-	"gvisor.dev/gvisor/runsc/boot/ingress"
 	"gvisor.dev/gvisor/runsc/config"
 )
 
@@ -809,74 +805,4 @@ func egressGateAddr16(a tcpip.Address) [16]byte {
 		return [16]byte{10: 0xff, 11: 0xff, 12: v4[0], 13: v4[1], 14: v4[2], 15: v4[3]}
 	}
 	return a.As16()
-}
-
-// --- Oca host-ingress relay (#541) ---------------------------------------------
-//
-// The relay itself (wire protocol, mux, pumps) lives in //runsc/boot/ingress
-// so the frozen oca-interoperable protocol stays testable with the plain Go
-// toolchain; this is the netstack-facing seam. The host owns the listener
-// lifecycle and announces every host-accepted connection as a framed OPEN
-// carrying the guest loopback dial target (127.0.0.1:<port>); this side
-// dials that target INSIDE the netstack via gonet — loopback never leaves
-// the sandbox and is exempt from the egress gate, so the guest service is
-// reachable under any egress policy — and pumps framed bytes both ways.
-
-// ingressDialTimeout bounds one guest loopback dial.
-const ingressDialTimeout = 5 * time.Second
-
-// validateIngressFD rejects --ingress-fd for any configuration where the
-// relay has no sandbox netstack to serve, instead of silently accepting the
-// flag and hanging the donating host — the same fail-closed posture as the
-// egress gate.
-func validateIngressFD(conf *config.Config, ingressFD *int) error {
-	if ingressFD == nil {
-		return nil
-	}
-	switch conf.Network {
-	case config.NetworkHost, config.NetworkPlugin:
-		return fmt.Errorf("--ingress-fd requires network=sandbox; %s networking has no sandbox netstack to dial", conf.Network)
-	}
-	return nil
-}
-
-// newIngressRelay wraps the donated FD in a net.Conn and builds the relay
-// with a dialer into the live root-namespace netstack. The Loader owns the
-// returned relay; serving starts when the kernel runs (see Loader.run).
-func newIngressRelay(donatedFD int, k *kernel.Kernel) (*ingress.Relay, error) {
-	f := os.NewFile(uintptr(donatedFD), "oca-ingress-fd")
-	if f == nil {
-		return nil, fmt.Errorf("oca ingress: invalid fd %d", donatedFD)
-	}
-	conn, err := net.FileConn(f)
-	f.Close()
-	if err != nil {
-		return nil, fmt.Errorf("oca ingress: FileConn(fd=%d): %w", donatedFD, err)
-	}
-	return ingress.NewRelay(conn, ingressNetstackDialer(k)), nil
-}
-
-// ingressNetstackDialer returns an ingress.Dialer that connects guest
-// targets inside the live root-namespace netstack via gonet. The stack is
-// resolved per dial so the relay keeps working across restore, which
-// replaces the kernel's pre-restore empty stack with the loaded one.
-func ingressNetstackDialer(k *kernel.Kernel) ingress.Dialer {
-	return func(target [16]byte, port uint16) (net.Conn, error) {
-		ns := k.RootNetworkNamespace()
-		s, ok := ns.Stack().(*netstack.Stack)
-		if !ok {
-			return nil, fmt.Errorf("oca ingress: no sandbox netstack to dial %d", port)
-		}
-		addr := tcpip.AddrFrom16(target)
-		if v4 := addr.To4(); v4.Len() == 4 {
-			addr = v4 // v4-in-v6 wire form → 4-byte netstack form
-		}
-		network := ipv6.ProtocolNumber
-		if addr.Len() == 4 {
-			network = ipv4.ProtocolNumber
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), ingressDialTimeout)
-		defer cancel()
-		return gonet.DialContextTCP(ctx, s.Stack, tcpip.FullAddress{Addr: addr, Port: port}, network)
-	}
 }

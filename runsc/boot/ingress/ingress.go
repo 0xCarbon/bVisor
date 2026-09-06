@@ -12,190 +12,217 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package ingress implements the Sentry-side endpoint of the Oca
-// host-ingress data path (Oca #541), served over the AF_UNIX stream
-// connection donated to runsc as --ingress-fd.
+// Package ingress carries host-accepted TCP connections into a sandbox over
+// a donated Unix stream socket. The host owns the listening sockets and chooses
+// each destination; the relay uses its Dialer to reach the sandbox network.
 //
-// The HOST owns the listener lifecycle and announces every host-accepted
-// connection as a framed OPEN carrying the guest dial target; this relay
-// dials that target inside the sandbox netstack (gonet loopback; see
-// runsc/boot) and pumps framed bytes both ways.
+// Version 1 frames have a big-endian uint32 body length followed by a version
+// byte, kind byte, and big-endian uint32 connection ID. OPEN adds a 16-byte IP
+// address and uint16 port; DIAL_RESULT adds a status byte; DATA adds payload.
+// CLOSE_WRITE ends only the sender's data direction. CLOSE cancels the whole
+// connection, including any pending dial or queued data. A final CLOSE from the
+// relay acknowledges teardown; only then may the host reuse that connection ID.
+// This wire format is compatible with github.com/0xCarbon/oca/network/ingress.go.
 //
-// Frame: uint32 big-endian body length, then body:
-//
-//	byte 0       protocol version (Version)
-//	byte 1       kind (one of Kind*)
-//	rest         per-kind payload:
-//
-//	  OPEN         host→sentry: connID(4) target IP(16, v4-in-v6) port(2)
-//	  DIAL_RESULT  sentry→host: connID(4) status(1)
-//	  DATA         both:        connID(4) payload
-//	  CLOSE_WRITE  both:        connID(4)  — half-close (no more data this way)
-//	  CLOSE        both:        connID(4)  — full teardown of the connection
-//
-// The wire format mirrors the oca host relay
-// (github.com/0xCarbon/oca/network/ingress.go) byte-for-byte; the leading
-// version byte makes any drift fail closed, and the golden vectors in
-// ingress_test.go pin the frozen bytes.
-//
-// Backpressure is transitive blocking with bounded per-connection queues:
-// a slow guest fills its queue, the mux blocks, the socketpair fills, and
-// the host stops reading its TCP connection — no unbounded buffering
-// anywhere on the path.
-//
-// Teardown invariant: per-connection queues are NEVER closed. CLOSE rides
-// an in-order frame to the pump, and relay teardown signals r.done and
-// closes guest connections instead — so a channel close can never race the
-// mux's send (no send-on-closed-panic), and the mux is free to park on a
-// full queue. A parked mux periodically polls the donated conn for
-// POLLRDHUP (peer close, observable even behind unread frames) so that a
-// host teardown on a stalled connection still ends the relay: the sandbox
-// never holds ambiguous state.
-//
-// Fail-closed: any framing, version, or protocol error ends Serve with an
-// error and tears down every carried connection (closing the donated conn);
-// the host observes the teardown on its end. A clean conn close (host
-// teardown at checkpoint/stop, with restore re-donating a fresh FD) ends
-// Serve with nil.
+// Queues and the number of carried connections are bounded. A full queue
+// applies backpressure to the whole transport. Malformed frames fail the relay
+// closed. Close cancels dials, closes all connections, and waits for workers;
+// per-connection queues are never closed, so teardown cannot race a queue send.
 package ingress
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"sync"
-	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
-// Wire protocol constants (frozen — see the package comment).
 const (
-	// Version is the wire version both sides encode as the first body byte.
-	Version uint8 = 1
-
-	KindOpen       uint8 = 1 // host→sentry: new accepted conn
-	KindDialResult uint8 = 2 // sentry→host: guest dial outcome
-	KindData       uint8 = 3 // payload, either direction
-	KindCloseWrite uint8 = 4 // half-close, either direction
-	KindClose      uint8 = 5 // full close, either direction
-
-	// Dial statuses carried in DIAL_RESULT (KindDialResult).
-	DialOK      uint8 = 1
-	DialRefused uint8 = 2
-
-	// fixedHeaderLen is the body length of the largest fixed-size frame
-	// (OPEN): version(1) + kind(1) + connID(4) + IP(16) + port(2).
-	fixedHeaderLen = 1 + 1 + 4 + 16 + 2
-
-	// MinFrameBody is the smallest legal body: version + kind + connID.
-	// Per-kind length validation happens after decode.
-	MinFrameBody = 6
-
-	// MaxDataChunk caps a single DATA payload. Larger host reads are split
-	// across frames; the cap bounds frame allocation from a corrupt length
-	// prefix.
-	MaxDataChunk = 64 * 1024
-
-	// MaxFrameBody caps any frame body so a hostile or corrupt length
-	// prefix cannot force an unbounded allocation.
-	MaxFrameBody = fixedHeaderLen + MaxDataChunk
-
-	// queueDepth bounds the per-connection frame queue. When full, the mux
-	// blocks — that is the backpressure contract.
-	queueDepth = 16
-
-	// peerCheckInterval bounds how long a mux parked on a full queue runs
-	// without re-probing the donated conn for host teardown.
+	Version        uint8 = 1
+	KindOpen       uint8 = 1
+	KindDialResult uint8 = 2
+	KindData       uint8 = 3
+	KindCloseWrite uint8 = 4
+	KindClose      uint8 = 5
+	DialOK         uint8 = 1
+	DialRefused    uint8 = 2
+	fixedHeaderLen       = 1 + 1 + 4 + 16 + 2
+	MinFrameBody         = 6
+	MaxDataChunk         = 64 * 1024
+	MaxFrameBody         = fixedHeaderLen + MaxDataChunk
+	// MaxConnections bounds live connections, including pending dials.
+	// Excess OPENs receive DialRefused without disturbing existing connections.
+	MaxConnections    = 1024
+	queueDepth        = 16
 	peerCheckInterval = 250 * time.Millisecond
 )
 
-// ErrRelayClosed reports the relay is already torn down; operations racing
-// the teardown end without touching the wire.
+// ErrRelayClosed reports that the transport is closed.
 var ErrRelayClosed = errors.New("ingress relay closed")
 
-// Dialer dials one guest-side connection for a host-announced target. The
-// target IP arrives in the 16-byte v4-in-v6 wire form. Production wires this
-// to a gonet dialer over the sandbox netstack (runsc/boot), which unmaps
-// v4-in-v6 and bounds the dial; tests wire it to a local listener.
-type Dialer func(target [16]byte, port uint16) (net.Conn, error)
+// Dialer connects a requested target within the sandbox. It must honor context
+// cancellation. Its connection must unblock IO on Close; implementing
+// CloseWrite() error also allows TCP half-closes to be preserved.
+type Dialer func(context.Context, [16]byte, uint16) (net.Conn, error)
 
-// Relay is the Sentry-side endpoint of the donated ingress conn. It owns
-// frame encoding (serialized writes), the reader/mux loop, and
-// per-connection dispatch queues. Create with NewRelay and run Serve.
+// Relay multiplexes carried connections over a donated Unix stream socket.
+// Call Serve once. Close is safe concurrently with Serve, including before it.
 type Relay struct {
-	conn net.Conn
-	dial Dialer
-
-	writeMu  sync.Mutex // serializes frame writes
-	doneOnce sync.Once
-	done     chan struct{} // closed when the relay is torn down
-
-	mu     sync.Mutex
-	conns  map[uint32]*carried
-	guests map[uint32]net.Conn
+	conn         net.Conn
+	dial         Dialer
+	ctx          context.Context
+	cancel       context.CancelFunc
+	shutdownOnce sync.Once
+	writeMu      sync.Mutex
+	mu           sync.Mutex
+	started      bool
+	err          error
+	conns        map[uint32]*carried
+	workers      sync.WaitGroup
 }
 
-// carried is one connection's mux state: the bounded queue of frames
-// awaiting the guest-side pump. The queue is never closed; teardown is
-// signalled through Relay.done (see the package teardown invariant).
 type carried struct {
+	id       uint32
+	ctx      context.Context
+	cancel   context.CancelFunc
 	outbound chan frame
+	// closing is protected by Relay.mu; later frames are discarded after CLOSE.
+	closing bool
+	mu      sync.Mutex
+	guest   net.Conn
 }
 
-// frame is one dispatched frame, applied in arrival order.
 type frame struct {
 	data       []byte
 	closeWrite bool
-	closeConn  bool
 }
 
-// NewRelay builds the relay over conn (the donated end of the AF_UNIX pair).
-// Call Serve to run the reader/mux.
+// NewRelay takes ownership of conn. The caller must either serve or close it.
 func NewRelay(conn net.Conn, dial Dialer) *Relay {
-	return &Relay{
-		conn:   conn,
-		dial:   dial,
-		done:   make(chan struct{}),
-		conns:  make(map[uint32]*carried),
-		guests: make(map[uint32]net.Conn),
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Relay{conn: conn, dial: dial, ctx: ctx, cancel: cancel, conns: make(map[uint32]*carried)}
+}
+
+func (cc *carried) close() {
+	cc.cancel()
+	cc.mu.Lock()
+	guest := cc.guest
+	cc.mu.Unlock()
+	if guest != nil {
+		_ = guest.Close()
 	}
 }
 
-func (r *Relay) failDone() {
-	r.doneOnce.Do(func() { close(r.done) })
+func (cc *carried) setGuest(guest net.Conn) bool {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if cc.ctx.Err() != nil {
+		_ = guest.Close()
+		return false
+	}
+	cc.guest = guest
+	return true
 }
 
-// write sends one raw frame; a write error fails the relay closed.
-func (r *Relay) write(frameBytes []byte) error {
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
-	if _, err := r.conn.Write(frameBytes); err != nil {
-		r.failDone()
+// shutdown does not wait, so workers can invoke it on transport failure.
+func (r *Relay) shutdown(err error) {
+	r.shutdownOnce.Do(func() {
+		r.mu.Lock()
+		r.err = err
+		r.cancel()
+		conns := make([]*carried, 0, len(r.conns))
+		for _, cc := range r.conns {
+			conns = append(conns, cc)
+		}
+		r.mu.Unlock()
 		_ = r.conn.Close()
-		go r.teardown()
-		return err
-	}
+		for _, cc := range conns {
+			cc.close()
+		}
+	})
+}
+
+// Close stops the relay and waits until all dials and guest IO have ended.
+func (r *Relay) Close() error {
+	r.shutdown(nil)
+	r.workers.Wait()
 	return nil
 }
 
-// Serve runs the relay until the donated conn closes (the host tears it down
-// at checkpoint/stop; restore donates a fresh FD), returning nil, or until a
-// framing/protocol/write failure fails it closed, returning an error. It
-// always closes the conn and every carried guest connection.
-func (r *Relay) Serve() error {
-	defer r.conn.Close()
-	defer r.failDone()
-	defer r.teardown()
+func (r *Relay) writeLocked(data []byte) error {
+	if r.ctx.Err() != nil {
+		return ErrRelayClosed
+	}
+	n, err := r.conn.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		r.shutdown(fmt.Errorf("ingress relay write: %w", err))
+	}
+	return err
+}
 
+func (r *Relay) write(data []byte) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	return r.writeLocked(data)
+}
+
+// Serve returns nil on host closure or Close, and the first transport/protocol
+// error on failure. No dial or guest IO worker survives its return.
+func (r *Relay) Serve() error {
+	r.mu.Lock()
+	if r.started {
+		r.mu.Unlock()
+		return errors.New("ingress relay already served")
+	}
+	r.started = true
+	if r.ctx.Err() != nil {
+		err := r.err
+		r.mu.Unlock()
+		return err
+	}
+	r.workers.Add(1)
+	r.mu.Unlock()
+	go r.monitorPeer()
+	err := r.serve()
+	r.shutdown(err)
+	r.workers.Wait()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.err
+}
+
+func (r *Relay) monitorPeer() {
+	defer r.workers.Done()
+	tick := time.NewTicker(peerCheckInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-tick.C:
+			// Observe host teardown even when a full queue prevents reads.
+			if peerGone(r.conn) {
+				r.shutdown(nil)
+				return
+			}
+		}
+	}
+}
+
+func (r *Relay) serve() error {
 	var lenBuf [4]byte
 	for {
 		if _, err := io.ReadFull(r.conn, lenBuf[:]); err != nil {
-			if errors.Is(err, io.EOF) || r.isDone() {
-				return nil // host closed the conn: clean teardown
+			if errors.Is(err, io.EOF) || r.ctx.Err() != nil {
+				return nil
 			}
 			return fmt.Errorf("ingress relay read: %w", err)
 		}
@@ -205,10 +232,10 @@ func (r *Relay) Serve() error {
 		}
 		body := make([]byte, n)
 		if _, err := io.ReadFull(r.conn, body); err != nil {
-			if r.isDone() {
-				return nil // torn down while reading: the conn is dead
+			if r.ctx.Err() != nil {
+				return nil
 			}
-			return fmt.Errorf("ingress relay read body (%d): %w", n, err)
+			return fmt.Errorf("ingress relay read body: %w", err)
 		}
 		if body[0] != Version {
 			return fmt.Errorf("ingress relay: protocol version %d, want %d", body[0], Version)
@@ -219,240 +246,171 @@ func (r *Relay) Serve() error {
 	}
 }
 
-func (r *Relay) isDone() bool {
-	select {
-	case <-r.done:
-		return true
-	default:
-		return false
-	}
-}
-
-// dispatch routes one decoded frame body.
 func (r *Relay) dispatch(body []byte) error {
-	kind := body[1]
-	id := binary.BigEndian.Uint32(body[2:6])
-
+	kind, id := body[1], binary.BigEndian.Uint32(body[2:6])
 	switch kind {
 	case KindOpen:
 		if len(body) != fixedHeaderLen {
-			return fmt.Errorf("ingress relay: OPEN body length %d, want %d", len(body), fixedHeaderLen)
+			return fmt.Errorf("ingress relay: OPEN body length %d", len(body))
 		}
-		var ip16 [16]byte
-		copy(ip16[:], body[6:22])
+		var target [16]byte
+		copy(target[:], body[6:22])
 		port := binary.BigEndian.Uint16(body[22:24])
-		cc := &carried{outbound: make(chan frame, queueDepth)}
 		r.mu.Lock()
+		if r.ctx.Err() != nil {
+			r.mu.Unlock()
+			return nil
+		}
 		if _, exists := r.conns[id]; exists {
 			r.mu.Unlock()
 			return fmt.Errorf("ingress relay: duplicate conn id %d", id)
 		}
-		// Registered before the dial starts, so host DATA racing the dial
-		// queues instead of being dropped.
+		if len(r.conns) >= MaxConnections {
+			r.mu.Unlock()
+			if err := r.write(MarshalDialResult(id, DialRefused)); err != nil {
+				return err
+			}
+			return r.write(MarshalClose(id))
+		}
+		ctx, cancel := context.WithCancel(r.ctx)
+		cc := &carried{id: id, ctx: ctx, cancel: cancel, outbound: make(chan frame, queueDepth)}
 		r.conns[id] = cc
+		// Add under mu so Close cannot wait before this worker is registered.
+		r.workers.Add(1)
 		r.mu.Unlock()
-		go r.dialAndServe(cc, id, ip16, port)
+		go r.dialAndServe(cc, target, port)
 		return nil
 	case KindData:
-		if len(body) < MinFrameBody {
-			return fmt.Errorf("ingress relay: DATA body length %d, want >= %d", len(body), MinFrameBody)
+		if len(body)-MinFrameBody > MaxDataChunk {
+			return fmt.Errorf("ingress relay: DATA payload too large: %d", len(body)-MinFrameBody)
 		}
 	case KindCloseWrite, KindClose:
 		if len(body) != MinFrameBody {
-			return fmt.Errorf("ingress relay: control body length %d, want %d", len(body), MinFrameBody)
+			return fmt.Errorf("ingress relay: control body length %d", len(body))
 		}
 	default:
 		return fmt.Errorf("ingress relay: unknown kind %d", kind)
 	}
-
 	r.mu.Lock()
 	cc := r.conns[id]
-	if kind == KindClose {
-		// Retire the connection: later frames for the id drop silently.
-		// The queue itself is never closed; the pump ends on the in-order
-		// closeConn frame below.
-		delete(r.conns, id)
-	}
-	r.mu.Unlock()
-	if cc == nil {
-		// Unknown id after a racing CLOSE: drop silently, never fail the
-		// whole relay for per-connection races.
+	if cc == nil || cc.closing {
+		r.mu.Unlock()
 		return nil
 	}
-	f := frame{
-		data:       body[6:],
-		closeWrite: kind == KindCloseWrite,
-		closeConn:  kind == KindClose,
+	if kind == KindClose {
+		cc.closing = true
 	}
-	for {
-		select {
-		case cc.outbound <- f:
-			return nil
-		case <-r.done:
-			// Teardown fired while the queue was full (the mux was
-			// blocked applying backpressure): exit instead of parking
-			// forever.
-			return ErrRelayClosed
-		case <-time.After(peerCheckInterval):
-			// Parked too long: the guest may be stalled while the host
-			// has gone away. Probe the conn without consuming stream
-			// data; if it is dead, fail the relay closed so teardown can
-			// run. Otherwise keep applying backpressure.
-			if r.peerGone() {
-				r.failDone()
-				_ = r.conn.Close()
-				go r.teardown()
-				return ErrRelayClosed
-			}
-		}
+	r.mu.Unlock()
+	if kind == KindClose {
+		cc.close()
+		return nil
+	}
+	select {
+	case cc.outbound <- frame{data: body[6:], closeWrite: kind == KindCloseWrite}:
+		return nil
+	case <-cc.ctx.Done():
+		return nil
 	}
 }
 
-// dialAndServe dials the guest target, reports the outcome, and pumps. The
-// queue cc is registered at OPEN time by dispatch, so host DATA racing the
-// dial queues instead of being dropped.
-func (r *Relay) dialAndServe(cc *carried, id uint32, targetIP [16]byte, targetPort uint16) {
-	guest, err := r.dial(targetIP, targetPort)
-	if err != nil {
-		_ = r.write(MarshalDialResult(id, DialRefused))
-		_ = r.write(MarshalClose(id))
-		r.forget(id)
-		return
-	}
-	if werr := r.write(MarshalDialResult(id, DialOK)); werr != nil {
-		_ = guest.Close()
-		r.forget(id)
-		return
-	}
-
+// retire publishes the final CLOSE only after both guest pumps have stopped.
+// Serialize removal with that frame so a reused ID cannot receive stale frames.
+func (r *Relay) retire(cc *carried) {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	r.mu.Lock()
-	r.guests[id] = guest
+	if r.conns[cc.id] != cc {
+		r.mu.Unlock()
+		return
+	}
+	delete(r.conns, cc.id)
 	r.mu.Unlock()
+	_ = r.writeLocked(MarshalClose(cc.id))
+}
 
-	// Guest→host: read the guest conn, forward DATA, EOF half-closes.
+func (r *Relay) dialAndServe(cc *carried, target [16]byte, port uint16) {
+	defer r.workers.Done()
+	defer r.retire(cc)
+	defer cc.close()
+	guest, err := r.dial(cc.ctx, target, port)
+	if err != nil || guest == nil {
+		if guest != nil {
+			_ = guest.Close()
+		}
+		if cc.ctx.Err() == nil {
+			_ = r.write(MarshalDialResult(cc.id, DialRefused))
+		}
+		return
+	}
+	if !cc.setGuest(guest) {
+		return
+	}
+	if err := r.write(MarshalDialResult(cc.id, DialOK)); err != nil {
+		return
+	}
+
+	// Closing the guest unblocks both directions. Join the reader before
+	// retiring this ID, preventing stale DATA/CLOSE frames after ID reuse.
+	readDone := make(chan struct{})
 	go func() {
+		defer close(readDone)
 		buf := make([]byte, MaxDataChunk)
 		for {
-			n, rerr := guest.Read(buf)
+			n, err := guest.Read(buf)
 			if n > 0 {
-				if werr := r.write(MarshalData(id, buf[:n])); werr != nil {
-					_ = guest.Close()
+				if werr := r.write(MarshalData(cc.id, buf[:n])); werr != nil {
+					cc.close()
 					return
 				}
 			}
-			if rerr != nil {
-				if errors.Is(rerr, io.EOF) {
-					_ = r.write(MarshalCloseWrite(id))
+			if err != nil {
+				if errors.Is(err, io.EOF) && cc.ctx.Err() == nil {
+					if werr := r.write(MarshalCloseWrite(cc.id)); werr != nil {
+						cc.close()
+					}
 				} else {
-					_ = r.write(MarshalClose(id))
+					cc.close()
 				}
-				_ = guest.Close()
-				r.forget(id)
 				return
 			}
 		}
 	}()
+	defer func() { cc.close(); <-readDone }()
 
-	// Host→guest: drain the outbound queue into the guest conn, in order. A
-	// full queue blocks the mux — the backpressure contract. The loop ends
-	// on the in-order closeConn frame, or via done when the relay tears
-	// down; either way the guest conn ends.
-	tick := time.NewTicker(peerCheckInterval)
-	defer tick.Stop()
+	hostEOF, guestEOF := false, false
+	readerDone := (<-chan struct{})(readDone)
 	for {
 		select {
+		case <-cc.ctx.Done():
+			return
+		case <-readerDone:
+			guestEOF = true
+			readerDone = nil
+			if hostEOF {
+				return
+			}
 		case f := <-cc.outbound:
 			if len(f.data) > 0 {
-				if _, werr := guest.Write(f.data); werr != nil {
-					_ = guest.Close()
-					r.forget(id)
+				if hostEOF {
+					return
+				}
+				n, err := guest.Write(f.data)
+				if err != nil || n != len(f.data) {
 					return
 				}
 			}
-			if f.closeWrite {
-				// Half-close toward the guest: no more host data will
-				// arrive.
-				if g, ok := guest.(interface{ CloseWrite() error }); ok {
-					_ = g.CloseWrite()
+			if f.closeWrite && !hostEOF {
+				halfCloser, ok := guest.(interface{ CloseWrite() error })
+				if !ok || halfCloser.CloseWrite() != nil {
+					return
+				}
+				hostEOF = true
+				if guestEOF {
+					return
 				}
 			}
-			if f.closeConn {
-				_ = guest.Close()
-				r.forget(id)
-				return
-			}
-		case <-r.done:
-			_ = guest.Close()
-			r.forget(id)
-			return
-		case <-tick.C:
-			if r.peerGone() {
-				// Host teardown on a stalled connection: fail closed. The
-				// deferred teardown of Serve (or the write-failure path)
-				// ends every remaining connection.
-				r.failDone()
-				_ = r.conn.Close()
-				_ = guest.Close()
-				r.forget(id)
-				return
-			}
 		}
 	}
-}
-
-// forget unregisters a connection and closes its guest conn. Idempotent.
-func (r *Relay) forget(id uint32) {
-	r.mu.Lock()
-	delete(r.conns, id)
-	guest := r.guests[id]
-	delete(r.guests, id)
-	r.mu.Unlock()
-	if guest != nil {
-		_ = guest.Close()
-	}
-}
-
-// teardown ends every carried connection by closing the guest conns (waking
-// blocked guest IO and the pumps writing to them); the pumps then exit via
-// done. Queues are never closed (see the package teardown invariant).
-func (r *Relay) teardown() {
-	r.mu.Lock()
-	guests := r.guests
-	r.conns = make(map[uint32]*carried)
-	r.guests = make(map[uint32]net.Conn)
-	r.mu.Unlock()
-	for _, g := range guests {
-		_ = g.Close()
-	}
-}
-
-// peerGone reports whether the donated conn is known-dead WITHOUT consuming
-// stream data: a zero-timeout poll for POLLRDHUP, which fires on host close
-// even while unread frames still mask a plain read's EOF. Best effort: an
-// unusable conn object counts as gone, an inconclusive poll counts as alive
-// (the read loop remains the authoritative death detector).
-func (r *Relay) peerGone() bool {
-	sc, ok := r.conn.(syscall.Conn)
-	if !ok {
-		return false
-	}
-	raw, err := sc.SyscallConn()
-	if err != nil {
-		return true // the conn object is closed
-	}
-	gone := false
-	if cerr := raw.Control(func(fd uintptr) {
-		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN | unix.POLLRDHUP}}
-		if _, errno := unix.Poll(fds, 0); errno != nil {
-			return
-		}
-		if fds[0].Revents&(unix.POLLRDHUP|unix.POLLHUP|unix.POLLERR) != 0 {
-			gone = true
-		}
-	}); cerr != nil {
-		return true
-	}
-	return gone
 }
 
 // --- frame marshaling (frozen; golden-tested) -------------------------------
@@ -512,6 +470,9 @@ func marshalControl(kind uint8, connID uint32) []byte {
 
 // withLen prefixes a body with its big-endian uint32 length.
 func withLen(body []byte) []byte {
+	if uint64(len(body)) > math.MaxUint32 {
+		panic("ingress frame exceeds uint32 length")
+	}
 	frameBytes := make([]byte, 4+len(body))
 	binary.BigEndian.PutUint32(frameBytes, uint32(len(body)))
 	copy(frameBytes[4:], body)
