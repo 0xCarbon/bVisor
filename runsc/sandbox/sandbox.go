@@ -996,12 +996,14 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		sentryBin = &gvisorbinaries.GvisorSentryPluginStack
 		sentryUsesCgo = true
 	}
-	bootBinPath := specutils.ExePath
-	if p, err := sentryBin.Path(); err == nil {
+	launcherPath := specutils.ExecutablePath(conf)
+	sidecars := gvisorbinaries.ForConfig(conf)
+	bootBinPath := launcherPath
+	if p, err := sidecars.Path(sentryBin); err == nil {
 		log.Infof("Sidecar %q found: booting sandbox with %s", sentryBin.Name, p)
 		bootBinPath = p
 	} else if conf.SidecarUsagePolicy.AllowEmbeddedFallback() {
-		sentryBin.WarnUnavailable(fmt.Sprintf("Sidecar %q not usable (%v): booting sandbox with runsc itself", sentryBin.Name, err))
+		sidecars.WarnUnavailable(sentryBin, fmt.Sprintf("Sidecar %q not usable (%v): booting sandbox with runsc itself", sentryBin.Name, err))
 	} else {
 		return fmt.Errorf("sidecar %q not usable (%v) and --sidecar-usage-policy is set to STRICT", sentryBin.Name, err)
 	}
@@ -1023,12 +1025,12 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	// If the prewarmer sidecar is available, exec it ahead of the boot binary.
 	// Its argv is `gvisor-prewarmer <binary> <argv[0]> [argv[1:]...]`.
-	if p, err := gvisorbinaries.GvisorSentryPrewarmer.Path(); err == nil {
+	if p, err := sidecars.Path(&gvisorbinaries.GvisorSentryPrewarmer); err == nil {
 		log.Infof("Sidecar %q found: prepending Sentry boot command with %s", gvisorbinaries.GvisorSentryPrewarmer.Name, p)
 		cmd.Args = append([]string{p, cmd.Path}, cmd.Args[0:]...)
 		cmd.Path = p
 	} else if conf.SidecarUsagePolicy != config.SidecarUsageStrict {
-		gvisorbinaries.GvisorSentryPrewarmer.WarnUnavailable(fmt.Sprintf("Sidecar %q not found or usable (%v). This slows down gVisor startup significantly", gvisorbinaries.GvisorSentryPrewarmer.Name, err))
+		sidecars.WarnUnavailable(&gvisorbinaries.GvisorSentryPrewarmer, fmt.Sprintf("Sidecar %q not found or usable (%v). This slows down gVisor startup significantly", gvisorbinaries.GvisorSentryPrewarmer.Name, err))
 	} else {
 		return fmt.Errorf("sidecar %q not usable (%v) and --sidecar-usage-policy is set to STRICT", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
 	}
@@ -1049,8 +1051,8 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		// Clear environment variables, unless --TESTONLY-unsafe-nonroot is set.
 		cmd.Env = []string{}
 	}
-	if bootBinPath != specutils.ExePath {
-		cmd.Env = gvisorbinaries.WithEnforceRelease(cmd.Env)
+	if bootBinPath != launcherPath {
+		cmd.Env = sidecars.WithEnforceRelease(cmd.Env)
 	}
 	if sentryUsesCgo {
 		// Platforms that use stub processes are not compatible with
@@ -2138,7 +2140,7 @@ func (s *Sandbox) maybeStartCheckpointGoferAndGetSocket(conf *config.Config, cg 
 			sysProcAttr.UseCgroupFD = true
 			sysProcAttr.CgroupFD = int(cloneIntoCgroupFD.Fd())
 		}
-		_, err := gvisorbinaries.CheckpointGofer.ForkExec(gvisorbinaries.Options{
+		_, err := gvisorbinaries.ForConfig(conf).ForkExec(&gvisorbinaries.CheckpointGofer, gvisorbinaries.Options{
 			Argv:        argv,
 			Envv:        env,
 			Files:       extraFiles,

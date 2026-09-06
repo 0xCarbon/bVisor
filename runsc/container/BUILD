@@ -9,6 +9,7 @@ go_library(
     name = "container",
     srcs = [
         "container.go",
+        "donations.go",
         "gofer_to_host_rpc.go",
         "null_netns.go",
         "state_file.go",

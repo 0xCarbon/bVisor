@@ -353,21 +353,24 @@ func TestVersionMismatchFailsClosed(t *testing.T) {
 // bounds, an unknown kind, a short control frame, and a duplicate OPEN each
 // tear the relay down.
 func TestMalformedFramesFailClosed(t *testing.T) {
+	// Invalid lengths must be rejected before reading a body. Sending a body
+	// races the relay's correct immediate close and can fail with EPIPE.
+	lengthPrefix := func(n uint32) []byte {
+		prefix := make([]byte, 4)
+		binary.BigEndian.PutUint32(prefix, n)
+		return prefix
+	}
 	cases := []struct {
 		name  string
 		frame []byte
 	}{
 		{
 			name:  "oversized length prefix",
-			frame: withLen(make([]byte, MaxFrameBody+1)),
+			frame: lengthPrefix(MaxFrameBody + 1),
 		},
 		{
-			name: "undersized length prefix",
-			frame: func() []byte {
-				f := make([]byte, 4+MinFrameBody-1)
-				binary.BigEndian.PutUint32(f, MinFrameBody-1)
-				return f
-			}(),
+			name:  "undersized length prefix",
+			frame: lengthPrefix(MinFrameBody - 1),
 		},
 		{
 			name:  "unknown kind",
