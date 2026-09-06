@@ -44,6 +44,8 @@ import (
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
+var libraryPlatform = flag.String("library-platform", "", "Platform for library lifecycle tests (empty uses the runsc default).")
+
 func TestMain(m *testing.M) {
 	config.RegisterFlags(flag.CommandLine)
 	log.SetLevel(log.Debug)
@@ -107,6 +109,9 @@ func defaultConfig(t *testing.T) *config.Config {
 func newTestRuntime(t *testing.T) (*library.Runtime, string) {
 	t.Helper()
 	def := defaultConfig(t)
+	if *libraryPlatform != "" {
+		def.Platform = *libraryPlatform
+	}
 	rootDir, err := os.MkdirTemp(testutil.TmpDir(), "library-root")
 	if err != nil {
 		t.Fatalf("os.MkdirTemp: %v", err)

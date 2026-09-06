@@ -15,22 +15,20 @@
 # limitations under the License.
 
 # kara_regression.sh runs the fork's root-required container regression
-# suite (waves 01-06) against a bazel-built runsc.
+# suite (waves 01-06) against a bazel-built release, including sidecars.
 #
 # The container test binaries need two things bazel's sandbox does not
 # provide: root (sandboxes, cgroups, PID namespaces) and a runsc binary in
 # a "runfiles-like" layout - testutil.ConfigureExePath runs BEFORE
 # flag.Parse, so the -runsc flag never applies outside bazel; it searches
-# the CWD for a path containing a "_main" element (FindFile("runsc/runsc")).
-# The validated invocation (see .wip/notes-wave02.md) is therefore: build a
-# STATIC runsc, symlink it under <tmp>/_main/runsc/runsc, cd into that tree
-# and run the compiled .test binary from there as root.
+# for release/runsc and release/gvisor-bin below a "_main" directory.
+# Copy the complete release there and run the compiled tests as root.
 #
 # Usage:
 #   tools/kara_regression.sh [-p platforms] [-r test-regex] [-t tmpdir]
 #     -p platforms   comma-separated platform list passed to the container
 #                    tests via their -test_platforms flag (default: systrap;
-#                    empty makes the tests use every available platform)
+#                    empty uses all container platforms and the library default)
 #     -r test-regex  -test.run filter for the container test binary
 #                    (default: the fork-added regression subset)
 #     -t tmpdir      scratch directory (default: mktemp)
@@ -59,18 +57,18 @@ WORK="${TMPDIR_ARG:-$(mktemp -d /tmp/kara-regression.XXXXXX)}"
 mkdir -p "${WORK}"
 echo "==> workspace: ${WORK}"
 
-echo "==> building static runsc and test binaries (bazel)"
-bazel build //runsc:runsc //runsc/container:container_test //runsc/library:library_test
+echo "==> building release and test binaries (bazel)"
+bazel build //:release //runsc/container:container_test //runsc/library:library_test
 
 echo "==> laying out the _main runfiles shape"
-mkdir -p "${WORK}/rt/_main/runsc"
-cp -f bazel-bin/runsc/runsc_/runsc "${WORK}/rt/_main/runsc/runsc"
+mkdir -p "${WORK}/rt/_main/release"
+cp -a bazel-bin/release/. "${WORK}/rt/_main/release/"
 cp -f bazel-bin/runsc/container/container_test_/container_test "${WORK}/container.test"
 cp -f bazel-bin/runsc/library/library_test_/library_test "${WORK}/library.test"
 chmod +x "${WORK}"/container.test "${WORK}"/library.test
 
 mkdir -p "${WORK}/tmp"
-cd "${WORK}/rt/_main/runsc"
+cd "${WORK}/rt/_main"
 
 echo "==> container regression subset (platforms: ${PLATFORMS})"
 sudo env TEST_TMPDIR="${WORK}/tmp" \
@@ -78,7 +76,15 @@ sudo env TEST_TMPDIR="${WORK}/tmp" \
   -test_platforms="${PLATFORMS}" -test.run "${CONTAINER_RUN}"
 
 echo "==> library reference embedder suite (platforms: ${PLATFORMS})"
-sudo env TEST_TMPDIR="${WORK}/tmp" \
-  "${WORK}/library.test" -test.v -test.timeout 1200s
+if [ -z "${PLATFORMS}" ]; then
+  LIBRARY_PLATFORMS=("")
+else
+  IFS=',' read -r -a LIBRARY_PLATFORMS <<< "${PLATFORMS}"
+fi
+for library_platform in "${LIBRARY_PLATFORMS[@]}"; do
+  sudo env TEST_TMPDIR="${WORK}/tmp" \
+    "${WORK}/library.test" -test.v -test.timeout 1200s \
+    -library-platform="${library_platform}"
+done
 
 echo "==> PASS"

@@ -42,7 +42,8 @@ type Options struct {
 	// "/proc/self/exe" re-executes the EMBEDDING process as the sentry —
 	// embedders that are not the runsc binary itself must set this to a
 	// real runsc binary path (the reference test does via the test
-	// harness).
+	// harness). Install the matching gvisor-bin/ sidecars next to that
+	// binary; build //:release to produce the complete layout.
 	ExePath string
 
 	// Platform is the sentry platform: "systrap" (default), "ptrace",

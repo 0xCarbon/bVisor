@@ -1667,7 +1667,7 @@ func TestCheckpointRestorePassFDDonation(t *testing.T) {
 				t.Fatalf("error creating restored container: %v", err)
 			}
 			defer cont2.Destroy()
-			if err := cont2.Restore(conf, dir, false /* direct */, false /* background */, false /* splitFSRestore */, nil /* networkArgs */); err != nil {
+			if err := cont2.Restore(conf, dir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
 				t.Fatalf("error restoring container: %v", err)
 			}
 
@@ -1741,7 +1741,7 @@ func TestCheckpointRestoreBackToBack(t *testing.T) {
 						t.Fatalf("cycle %d: failed to wait for output file: %v", cycle, err)
 					}
 				} else {
-					if err := cont.Restore(conf, prevDir, false /* direct */, false /* background */, false /* splitFSRestore */, nil /* networkArgs */); err != nil {
+					if err := cont.Restore(conf, prevDir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
 						t.Fatalf("cycle %d: error restoring container: %v", cycle, err)
 					}
 					if err := waitForFileNotEmpty(outputFile); err != nil {
@@ -1924,7 +1924,7 @@ func restoreIntoNewContainer(t *testing.T, conf *config.Config, spec *specs.Spec
 		t.Fatalf("error creating restored container: %v", err)
 	}
 	t.Cleanup(func() { cont.Destroy() })
-	if err := cont.Restore(conf, dir, false /* direct */, false /* background */, false /* splitFSRestore */, nil /* networkArgs */); err != nil {
+	if err := cont.Restore(conf, dir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
 		t.Fatalf("error restoring container: %v", err)
 	}
 	return cont
