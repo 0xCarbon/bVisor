@@ -229,10 +229,19 @@ type Args struct {
 	// at "none" or "memory" (self/anon filestores need runsc's local gofer).
 	IOFDs []int
 
+	// IOFiles is the owned-file form of IOFDs. Cannot be used with IOFDs.
+	// New consumes these files on every return, including validation errors.
+	// Valid only for the root container of a new sandbox.
+	IOFiles []*os.File
+
 	// EgressFD is the optional AF_UNIX FD to the Oca egress flow gate. A nil
 	// pointer disables the data path; an explicit descriptor 0 remains valid.
 	// Re-donated to the sandbox (Oca #447).
 	EgressFD *int
+
+	// EgressFile is the owned-file form of EgressFD. Cannot be used with
+	// EgressFD. New consumes it on every return. Valid only for a new sandbox.
+	EgressFile *os.File
 
 	// IngressFD is the optional host-ingress Unix stream descriptor.
 	// Deprecated: use IngressFile. Cannot be set together with IngressFile.
@@ -247,18 +256,9 @@ type Args struct {
 // indicates that an existing Sandbox should be used. The caller must call
 // Destroy() on the container.
 func New(conf *config.Config, args Args) (*Container, error) {
-	if args.IngressFile != nil {
-		defer args.IngressFile.Close()
-	}
-	if args.IngressFD != nil {
-		if args.IngressFile != nil {
-			return nil, fmt.Errorf("IngressFD and IngressFile cannot both be set")
-		}
-		if *args.IngressFD < 0 {
-			return nil, fmt.Errorf("invalid ingress FD %d", *args.IngressFD)
-		}
-		args.IngressFile = os.NewFile(uintptr(*args.IngressFD), "ingress-fd")
-		defer args.IngressFile.Close()
+	defer args.closeDonations()
+	if err := args.prepareDonations(); err != nil {
+		return nil, err
 	}
 	if args.IngressFile != nil {
 		fd := int(args.IngressFile.Fd())
@@ -268,6 +268,9 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		if !specutils.IsRootContainer(args.Spec) {
 			return nil, fmt.Errorf("ingress donation requires a root container")
 		}
+	}
+	if (len(args.IOFiles) != 0 || args.EgressFile != nil || len(args.PassFiles) != 0 || args.ExecFile != nil) && !specutils.IsRootContainer(args.Spec) {
+		return nil, fmt.Errorf("create-time file donations require a root container")
 	}
 	log.Debugf("Create container, cid: %s, rootDir: %q", args.ID, conf.RootDir)
 	if err := validateID(args.ID); err != nil {
@@ -433,17 +436,18 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		return err
 	}
 	if err := cgroup.RunInCgroup(containerCgroup, func(cloneIntoCgroupFD *os.File) error {
-		ioFiles, goferFilestores, devIOFile, specFile, err := c.createGoferProcess(conf, mountHints, args.Attached, cloneIntoCgroupFD, args.IOFDs)
+		ioFiles, goferFilestores, devIOFile, specFile, err := c.createGoferProcess(conf, mountHints, args.Attached, cloneIntoCgroupFD, args.IOFiles)
 		if err != nil {
 			return fmt.Errorf("cannot create gofer process: %w", err)
 		}
+		// These files can be closed by the donation agency during launch.
+		// Keep the same owners for cleanup if sandbox setup fails earlier.
+		defer closeFiles(ioFiles...)
+		defer closeFiles(goferFilestores...)
+		defer closeFiles(devIOFile, specFile)
 
 		// Start a new sandbox for this container. Any errors after this point
 		// must destroy the container.
-		var egressFile *os.File
-		if args.EgressFD != nil {
-			egressFile = os.NewFile(uintptr(*args.EgressFD), "oca-egress-fd")
-		}
 		sandArgs := &sandbox.Args{
 			ID:                  sandboxID,
 			Spec:                args.Spec,
@@ -451,7 +455,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			ConsoleSocket:       args.ConsoleSocket,
 			UserLog:             args.UserLog,
 			IOFiles:             ioFiles,
-			EgressFile:          egressFile,
+			EgressFile:          args.EgressFile,
 			IngressFile:         args.IngressFile,
 			DevIOFile:           devIOFile,
 			MountsFile:          specFile,
@@ -737,9 +741,9 @@ func (c *Container) Event() (*boot.EventOut, error) {
 // donated fd becomes a bidirectional stream to (container, port), which is
 // the minimum host-to-sandbox dial surface for health probes that must not
 // exec inside the sandbox. opts.FilePayload must contain exactly one fd
-// (e.g. one end of a socketpair); PortForward blocks for the lifetime of
-// the forwarded connection. With host networking the dial targets
-// 127.0.0.1:port. The `runsc port-forward` CLI wraps the same RPC.
+// (e.g. one end of a socketpair). PortForward returns once forwarding has
+// started; the sandbox owns the connection until it closes. With host networking
+// the dial targets 127.0.0.1:port. The `runsc port-forward` CLI wraps the same RPC.
 func (c *Container) PortForward(opts *boot.PortForwardOpts) error {
 	if err := c.requireStatus("port forward", Running); err != nil {
 		return err
@@ -1538,7 +1542,7 @@ func createLisafsSocketPair(sandEnds *[]*os.File, donations *donation.Agency) er
 // a gofer endpoint for the mount points using Gofers. The mounts file is the
 // file to read list of mounts after they have been resolved (direct paths,
 // no symlinks), and will be nil if there is no cleaning required for mounts.
-func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.PodMountHints, attached bool, cloneIntoCgroupFD *os.File, ioFDs []int) ([]*os.File, []*os.File, *os.File, *os.File, error) {
+func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.PodMountHints, attached bool, cloneIntoCgroupFD *os.File, donatedIOFiles []*os.File) ([]*os.File, []*os.File, *os.File, *os.File, error) {
 	rootfsHint, err := boot.NewRootfsHint(c.Spec)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("error creating rootfs hint: %w", err)
@@ -1559,7 +1563,7 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 	// gofer mounts (root first, then spec mounts) -- the same ordering runsc's
 	// own gofer uses. This lets an embedder (e.g. Oca managed mode) serve the
 	// sandbox filesystem from its own gofer process.
-	if len(ioFDs) > 0 {
+	if len(donatedIOFiles) > 0 {
 		if shouldCreateDeviceGofer(c.Spec, conf) {
 			return nil, nil, nil, nil, fmt.Errorf("external gofer (--io-fds) is not supported alongside a device gofer (GPU/TPU)")
 		}
@@ -1585,15 +1589,8 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 				wantFDs++
 			}
 		}
-		if len(ioFDs) != wantFDs {
-			return nil, nil, nil, nil, fmt.Errorf("external gofer: got %d --io-fds but the spec needs %d gofer IO FD(s)", len(ioFDs), wantFDs)
-		}
-		sandEnds := make([]*os.File, 0, len(ioFDs))
-		for i, fd := range ioFDs {
-			if fd < 0 {
-				return nil, nil, nil, nil, fmt.Errorf("external gofer: invalid --io-fds entry %d: fd %d", i, fd)
-			}
-			sandEnds = append(sandEnds, os.NewFile(uintptr(fd), fmt.Sprintf("external gofer IO FD %d", i)))
+		if len(donatedIOFiles) != wantFDs {
+			return nil, nil, nil, nil, fmt.Errorf("external gofer: got %d --io-fds but the spec needs %d gofer IO FD(s)", len(donatedIOFiles), wantFDs)
 		}
 		// No gofer process is spawned, so cloneIntoCgroupFD is not consumed
 		// here: there is no gofer to spawn into the container cgroup. The FD
@@ -1602,7 +1599,7 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 		// c.GoferPid stays unset and goferIsChild remains false, so teardown
 		// won't try to reap a child we didn't start. MountsFile is nil; boot
 		// treats mounts-fd as optional (default -1).
-		return sandEnds, nil, nil, nil, nil
+		return donatedIOFiles, nil, nil, nil, nil
 	}
 	if !shouldSpawnGofer(c.Spec, conf, c.GoferMountConfs) {
 		if !c.GoferMountConfs[0].ShouldUseErofs() {
@@ -1674,7 +1671,7 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 	}
 
 	// Start with the general config flags.
-	cmd := exec.Command(specutils.ExePath, conf.ToFlags()...)
+	cmd := exec.Command(specutils.ExecutablePath(conf), conf.ToFlags()...)
 	// Don't forward GOMAXPROCS defaults that apply to this process (in
 	// particular, containerd-shim-runsc-v1 passes GOMAXPROCS=2 in
 	// v1.service.newCommand()).

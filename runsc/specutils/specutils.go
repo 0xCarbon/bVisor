@@ -96,6 +96,15 @@ const (
 // changed in tests that aren't linked in the same binary.
 var ExePath = "/proc/self/exe"
 
+// ExecutablePath returns the launcher's configured runsc binary. Embedders
+// should set Config.ExecutablePath instead of changing the process-wide default.
+func ExecutablePath(conf *config.Config) string {
+	if conf.ExecutablePath != "" {
+		return conf.ExecutablePath
+	}
+	return ExePath
+}
+
 // Version is the supported spec version.
 var Version = specs.Version
 
@@ -136,6 +145,9 @@ func LogSpecCustomLogger(orig *specs.Spec, logSeccomp bool, logf func(format str
 
 // ValidateSpec validates that the spec is compatible with runsc.
 func ValidateSpec(spec *specs.Spec, conf *config.Config) error {
+	if spec == nil {
+		return fmt.Errorf("Spec must be defined")
+	}
 	// Mandatory fields.
 	if spec.Process == nil {
 		return fmt.Errorf("Spec.Process must be defined: %+v", spec)
@@ -235,8 +247,9 @@ func ReadSpec(bundleDir string, conf *config.Config) (*specs.Spec, error) {
 // up the spec so that the rest of the code doesn't need to worry about it.
 //  1. Normalizes all relative paths into absolute by prepending the bundle
 //     dir to them.
-//  2. Looks for flag overrides and applies them if any.
-//  3. Removes seccomp rules if `RuntimeDefault` was used.
+//  2. Removes seccomp rules if `RuntimeDefault` was used.
+//
+// Configuration annotations are applied separately by FixConfig.
 func ReadSpecFromFile(bundleDir string, specFile *os.File, conf *config.Config) (*specs.Spec, error) {
 	if _, err := specFile.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("error seeking to beginning of file %q: %v", specFile.Name(), err)
@@ -255,13 +268,20 @@ func ReadSpecFromFile(bundleDir string, specFile *os.File, conf *config.Config) 
 			log.Warningf("OCI spec file %q contains fields unknown to `runsc`: %v. Ignoring these fields and continuing anyway.", specFile.Name(), errStrictDecode)
 		}
 	}
-	if err := ValidateSpec(&spec, conf); err != nil {
-		return nil, err
-	}
-	if err := fixSpec(&spec, bundleDir, conf); err != nil {
+	if err := PrepareSpec(&spec, bundleDir, conf); err != nil {
 		return nil, err
 	}
 	return &spec, nil
+}
+
+// PrepareSpec validates and normalizes an in-memory OCI spec, using the same
+// rules as ReadSpecFromFile. It modifies spec; callers that share a spec must
+// copy it first. Configuration annotations are applied separately by FixConfig.
+func PrepareSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
+	if err := ValidateSpec(spec, conf); err != nil {
+		return err
+	}
+	return fixSpec(spec, bundleDir, conf)
 }
 
 func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
@@ -293,6 +313,13 @@ func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 
 // FixConfig fixes config options that are set via annotations in the spec.
 func FixConfig(conf *config.Config, spec *specs.Spec) error {
+	return FixConfigWithFlagSet(conf, spec, flag.CommandLine)
+}
+
+// FixConfigWithFlagSet applies OCI configuration annotations with the supplied
+// flag set. Both conf and flagSet are modified. Embedders should provide private
+// copies, with flagSet initialized to conf's current flag values.
+func FixConfigWithFlagSet(conf *config.Config, spec *specs.Spec, flagSet *flag.FlagSet) error {
 	// Look for config bundle annotations and verify that they exist.
 	const configBundlePrefix = "dev.gvisor.bundle."
 	var bundles []config.BundleName
@@ -314,7 +341,7 @@ func FixConfig(conf *config.Config, spec *specs.Spec) error {
 	// Apply config bundles, if any.
 	if len(bundles) > 0 {
 		log.Infof("Applying config bundles: %v", bundles)
-		if err := conf.ApplyBundles(flag.CommandLine, bundles...); err != nil {
+		if err := conf.ApplyBundles(flagSet, bundles...); err != nil {
 			return err
 		}
 	}
@@ -325,7 +352,7 @@ func FixConfig(conf *config.Config, spec *specs.Spec) error {
 			// instance.
 			name := annotation[len(annotationFlagPrefix):]
 			log.Infof("Overriding flag from flag annotation: --%s=%q", name, val)
-			if err := conf.Override(flag.CommandLine, name, val /* force= */, false); err != nil {
+			if err := conf.Override(flagSet, name, val /* force= */, false); err != nil {
 				return err
 			}
 		}

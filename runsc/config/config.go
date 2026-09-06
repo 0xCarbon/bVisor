@@ -19,6 +19,7 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -50,6 +51,11 @@ import (
 //     if it is no longer needed at all.
 //  2. Add the flag to flags_graveyard.go and remove it from flags.go.
 type Config struct {
+	// ExecutablePath selects the runsc installation used by this launcher.
+	// Empty uses specutils.ExePath. This is launcher configuration, not a
+	// command-line flag or an OCI annotation override.
+	ExecutablePath string
+
 	// RootDir is the runtime root directory.
 	RootDir string `flag:"root"`
 
@@ -486,6 +492,14 @@ type Config struct {
 	// Access to SharedRootDir grants the ability to identify sandboxes, but
 	// not to control them.
 	SharedRootDir string `flag:"shared-root"`
+}
+
+// Clone returns an independent configuration, retaining which flags were
+// explicitly set. Keep reference-valued fields independent when adding fields.
+func (c *Config) Clone() *Config {
+	copy := *c
+	copy.explicitlySet = maps.Clone(c.explicitlySet)
+	return &copy
 }
 
 // Validate checks that the Config is in a consistent state, e.g. that no

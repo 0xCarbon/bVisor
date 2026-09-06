@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/compat"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/sandbox"
 )
@@ -47,9 +48,12 @@ type Container struct {
 // ID returns the container's unique identifier.
 func (c *Container) ID() string { return c.cont.ID }
 
-// Spec returns the OCI spec the container runs. The spec is shared with the
-// underlying container; callers must not mutate it.
-func (c *Container) Spec() *specs.Spec { return c.cont.Spec }
+// Spec returns an independent copy of the OCI spec the container runs.
+func (c *Container) Spec() *specs.Spec { return copySpec(c.cont.Spec) }
+
+// Config returns an independent snapshot of this container's effective
+// configuration, including its OCI configuration annotations.
+func (c *Container) Config() *config.Config { return c.rt.Config() }
 
 // SandboxPid returns the PID of the sandbox (sentry) process, or -1 if it is
 // not running. It is the embedder's liveness probe for the sandbox itself.
@@ -177,6 +181,21 @@ func (c *Container) Checkpoint(opts CheckpointOptions) (*CheckpointResult, error
 // (call Destroy) — the library does not auto-destroy here, only
 // Runtime.Restore (the fresh-create path) cleans up on failure.
 func (c *Container) Restore(opts RestoreOptions) error {
+	if len(opts.GoferIOFiles) != 0 || opts.EgressFile != nil || len(opts.PassFiles) != 0 || opts.ExecFile != nil {
+		return fmt.Errorf("library: gofer, egress, pass-file and executable donations require restoring to a fresh container ID")
+	}
+	if err := c.restore(opts); err != nil {
+		return err
+	}
+	if opts.IngressFile != nil {
+		opts.IngressFile.Close()
+	}
+	return nil
+}
+
+// restore borrows options and files. The entry point commits ownership only
+// after its entire operation succeeds, including fresh container creation.
+func (c *Container) restore(opts RestoreOptions) error {
 	if opts.SplitFSRestore {
 		return fmt.Errorf("library: split filesystem restore is no longer supported")
 	}
@@ -190,9 +209,6 @@ func (c *Container) Restore(opts RestoreOptions) error {
 	}
 	if err := c.cont.RestoreWithOptions(c.rt.conf, container.RestoreOptions{ImagePath: opts.ImagePath, Direct: opts.Direct, Background: opts.Background, IngressFile: opts.IngressFile}); err != nil {
 		return fmt.Errorf("library: restoring container %q from %q: %w", c.cont.ID, opts.ImagePath, err)
-	}
-	if opts.IngressFile != nil {
-		opts.IngressFile.Close()
 	}
 	return nil
 }
@@ -255,10 +271,21 @@ func (c *Container) State() specs.State { return c.cont.State() }
 // PID. args follow control.ExecArgs (the `runsc exec` surface); FDs set
 // there are donated into the sandbox and consumed on success.
 func (c *Container) Execute(args *control.ExecArgs) (int32, error) {
-	pid, err := c.cont.Execute(c.rt.conf, args)
+	if args == nil {
+		return 0, fmt.Errorf("library: Execute requires arguments")
+	}
+	var donations fileDonations
+	defer donations.close()
+	copyArgs := *args
+	var err error
+	if copyArgs.Files, err = donations.copyFiles(args.Files); err != nil {
+		return 0, fmt.Errorf("library: acquiring exec files: %w", err)
+	}
+	pid, err := c.cont.Execute(c.rt.conf, &copyArgs)
 	if err != nil {
 		return pid, fmt.Errorf("library: executing in container %q: %w", c.cont.ID, err)
 	}
+	donations.commit()
 	return pid, nil
 }
 
@@ -274,11 +301,22 @@ func (c *Container) Event() (*boot.EventOut, error) {
 
 // PortForward starts forwarding a container port over the UDS (or local
 // port) carried in opts.FilePayload to the `runsc portforward` surface. The
-// donated FD is consumed; the call blocks while forwarding continues.
+// donated files are consumed on success and retained by the caller on error.
 func (c *Container) PortForward(opts *boot.PortForwardOpts) error {
-	if err := c.cont.PortForward(opts); err != nil {
+	if opts == nil {
+		return fmt.Errorf("library: PortForward requires options")
+	}
+	var donations fileDonations
+	defer donations.close()
+	copyOpts := *opts
+	var err error
+	if copyOpts.Files, err = donations.copyFiles(opts.Files); err != nil {
+		return fmt.Errorf("library: acquiring port-forward files: %w", err)
+	}
+	if err := c.cont.PortForward(&copyOpts); err != nil {
 		return fmt.Errorf("library: port-forwarding container %q: %w", c.cont.ID, err)
 	}
+	donations.commit()
 	return nil
 }
 

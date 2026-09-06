@@ -64,6 +64,17 @@
 // state-file layout. Runtime.Load adopts a container created earlier (by this
 // process or by a CLI invocation).
 //
+// # Configuration and specs
+//
+// Runtime.Config returns a snapshot of the base configuration. Create and fresh
+// Restore validate and normalize private spec copies, then apply configuration
+// annotations with the same override policy as the CLI. Each Container retains
+// that effective configuration across lifecycle calls. Load and existing-ID
+// Restore apply the saved spec's annotations to the runtime's base configuration.
+// Container.Config and Container.Spec return independent snapshots. Callers may
+// reuse an input spec after a call returns; they must not modify it during a call.
+// Compatibility checks use the platform selected by the effective configuration.
+//
 // # FD donation
 //
 // CreateOptions/RestoreOptions carry the wave-02 donation surface as
@@ -82,17 +93,16 @@
 //	  call provides under the same number (and container-name annotation).
 //	ExecFile:    host executable file for the container init process.
 //
-// OWNERSHIP: IngressFile is consumed only on success; on error it remains
-// caller-owned. The runtime closes its own duplicate on every return. Other
-// donated files retain the legacy ownership contract: the library dups each descriptor
-// and closes the caller's *os.File (disarming its finalizer) at Create or
-// Restore time; the runtime then donates the dup and closes it
-// (donation.DonateAndClose for gofer/egress connections) or transfers it
-// (DonateAndTransferCustomFiles for PassFiles) once creation succeeds.
-// Callers must not use or close the files after passing them (the library
-// already did). On failure before the sandbox spawn, the dup is closed by
-// the library and the caller's file was already closed — the descriptor is
-// deterministically released either way.
+// OWNERSHIP: Create and Restore borrow all donated files for the duration of
+// the call and consume them only on success. On error the originals remain
+// caller-owned, though a peer may have observed an attempted operation. The
+// library uses private close-on-exec duplicates and closes those duplicates on
+// every return. Do not use or close a file concurrently with its donation. A
+// failed fresh restore retains the originals even if container creation had
+// already succeeded. PassFiles and ExecFile follow the same ownership rule.
+// Existing-container restore accepts only an IngressFile replacement; other
+// donations require a fresh container ID and are rejected if they would be
+// ignored.
 //
 // # Concurrency
 //

@@ -17,10 +17,8 @@ package library
 import (
 	"fmt"
 	"os"
-	"runtime"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"golang.org/x/sys/unix"
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/runsc/config"
@@ -39,7 +37,7 @@ type Options struct {
 	Root string
 
 	// ExePath is the path to the runsc binary used to spawn the sandbox
-	// and gofer processes (specutils.ExePath). The default
+	// and gofer processes. The default
 	// "/proc/self/exe" re-executes the EMBEDDING process as the sentry —
 	// embedders that are not the runsc binary itself must set this to a
 	// real runsc binary path (the reference test does via the test
@@ -83,10 +81,6 @@ type Options struct {
 // configuration; share it across goroutines; build Containers from it.
 type Runtime struct {
 	conf *config.Config
-	// exePath is the runsc binary for sandbox/gofer spawns; empty means
-	// the specutils default (/proc/self/exe). Scoped per-Runtime (not the
-	// specutils global) so concurrent Runtimes do not interfere.
-	exePath string
 }
 
 // New validates opts and returns a Runtime. It never touches the network,
@@ -96,7 +90,7 @@ func New(opts Options) (*Runtime, error) {
 	// Build the config from flag-registration defaults, the same mechanism
 	// the CLI uses for an unparsed flag set (and testutil.TestConfig for
 	// tests): RegisterFlags installs every default, NewFromFlags snapshots
-	// them into a Config and validates it. No argv is parsed anywhere.
+	// them into a Config and validates it. Process arguments are never parsed.
 	fs := flag.NewFlagSet("runsc-library", flag.ContinueOnError)
 	config.RegisterFlags(fs)
 	conf, err := config.NewFromFlags(fs)
@@ -106,6 +100,12 @@ func New(opts Options) (*Runtime, error) {
 
 	if opts.Root != "" {
 		conf.RootDir = opts.Root
+	}
+	// Snapshot the launcher default so this runtime never needs to mutate
+	// specutils.ExePath, including during later checkpoint gofer launches.
+	conf.ExecutablePath = specutils.ExePath
+	if opts.ExePath != "" {
+		conf.ExecutablePath = opts.ExePath
 	}
 	if opts.Platform != "" {
 		conf.Platform = opts.Platform
@@ -131,13 +131,13 @@ func New(opts Options) (*Runtime, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid runtime configuration: %w", err)
 	}
-	return &Runtime{conf: conf, exePath: opts.ExePath}, nil
+	return &Runtime{conf: conf.Clone()}, nil
 }
 
-// Config returns the runsc configuration this runtime was built with. The
-// returned config is shared: callers must not mutate it (copy first).
+// Config returns an independent snapshot of the runtime's base configuration.
+// Changes to the snapshot do not affect this runtime or its containers.
 func (r *Runtime) Config() *config.Config {
-	return r.conf
+	return r.conf.Clone()
 }
 
 // CreateOptions are the arguments for Runtime.Create: the library view of
@@ -146,7 +146,8 @@ type CreateOptions struct {
 	// ID is the container ID (required, validated by runsc).
 	ID string
 
-	// Spec is the OCI runtime spec (required).
+	// Spec is the OCI runtime spec (required). Create validates and normalizes
+	// a private copy and applies its configuration annotations as the CLI does.
 	Spec *specs.Spec
 
 	// BundleDir is the bundle directory the spec was read from; stored in
@@ -202,50 +203,37 @@ func (r *Runtime) Create(opts CreateOptions) (*Container, error) {
 	if opts.Spec == nil {
 		return nil, fmt.Errorf("library: Create requires a Spec")
 	}
+	rt, spec, bundle, err := r.prepareSpec(opts.Spec, opts.BundleDir)
+	if err != nil {
+		return nil, err
+	}
 	args := container.Args{
 		ID:                 opts.ID,
-		Spec:               opts.Spec,
-		BundleDir:          opts.BundleDir,
+		Spec:               spec,
+		BundleDir:          bundle,
 		ConsoleSocket:      opts.ConsoleSocket,
 		PIDFile:            opts.PIDFile,
 		UserLog:            opts.UserLog,
 		Attached:           opts.Attached,
+		IOFiles:            opts.GoferIOFiles,
+		EgressFile:         opts.EgressFile,
+		IngressFile:        opts.IngressFile,
 		PassFiles:          opts.PassFiles,
 		ExecFile:           opts.ExecFile,
 		FSRestoreImagePath: opts.FSRestoreImagePath,
 		FSRestoreDirect:    opts.FSRestoreDirect,
 	}
-	ingressFile, err := duplicateFile(opts.IngressFile)
+	var donations fileDonations
+	defer donations.close()
+	if err := donations.acquire(&args); err != nil {
+		return nil, fmt.Errorf("library: %w", err)
+	}
+	c, err := container.New(rt.conf, args)
 	if err != nil {
-		return nil, fmt.Errorf("library: acquiring ingress file: %w", err)
-	}
-	if ingressFile != nil {
-		defer ingressFile.Close()
-		args.IngressFile = ingressFile
-	}
-	ioFDs, err := fileFDs(opts.GoferIOFiles)
-	if err != nil {
-		return nil, fmt.Errorf("library: acquiring gofer IO files: %w", err)
-	}
-	args.IOFDs = ioFDs
-	if args.EgressFD, err = fileFD(opts.EgressFile); err != nil {
-		closeFDs(ioFDs)
-		return nil, fmt.Errorf("library: acquiring egress file: %w", err)
-	}
-	if r.exePath != "" {
-		prev := specutils.ExePath
-		specutils.ExePath = r.exePath
-		defer func() { specutils.ExePath = prev }()
-	}
-	c, err := container.New(r.conf, args)
-	if err != nil {
-		closeFDs(filterNil(args.EgressFD, ioFDs))
 		return nil, fmt.Errorf("library: creating container %q: %w", opts.ID, err)
 	}
-	if opts.IngressFile != nil {
-		opts.IngressFile.Close()
-	}
-	return &Container{rt: r, cont: c}, nil
+	donations.commit()
+	return &Container{rt: rt, cont: c}, nil
 }
 
 // Load adopts an existing container from the runtime root directory (any
@@ -257,7 +245,7 @@ func (r *Runtime) Load(id string) (*Container, error) {
 	if err != nil {
 		return nil, fmt.Errorf("library: loading container %q: %w", id, err)
 	}
-	return &Container{rt: r, cont: c}, nil
+	return r.adopt(c)
 }
 
 // RestoreOptions are the arguments for Runtime.Restore: the library view of
@@ -269,8 +257,10 @@ type RestoreOptions struct {
 	// ImagePath is the checkpoint image directory (required).
 	ImagePath string
 
-	// Spec is the OCI spec for the restored container. When nil it is read
-	// from BundleDir/config.json, exactly like the CLI.
+	// Spec is the OCI spec for a fresh restored container. A private copy is
+	// validated and normalized, including its configuration annotations.
+	// When nil it is read from BundleDir/config.json. Existing containers use
+	// their saved spec and do not need the bundle to remain available.
 	Spec *specs.Spec
 
 	// BundleDir is the bundle directory for the spec (defaults to the
@@ -303,10 +293,9 @@ type RestoreOptions struct {
 	// connections here, and saved guest descriptors re-bind to the
 	// PassFiles given now (see package doc). Consumed on success.
 	//
-	// CLI contract: donations are consumed only on the fresh-create path
-	// (no container with opts.ID exists yet). When an existing container is
-	// adopted, the CLI reuses its saved configuration and these fields are
-	// unused.
+	// These donations apply only to a fresh container. They are rejected
+	// when adopting an existing container, whose create-time donations
+	// cannot be replaced by the restore RPC.
 	GoferIOFiles []*os.File
 	EgressFile   *os.File
 	PassFiles    map[int]*os.File
@@ -342,9 +331,29 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 		return nil, fmt.Errorf("library: Restore requires an ImagePath")
 	}
 	if opts.ExpectedCompatKey != "" {
-		if err := r.checkCompatKey(opts.ExpectedCompatKey, opts.Driver); err != nil {
+		if err := r.compareCompatKey(opts.ExpectedCompatKey, opts.Driver, false /* platformKnown */); err != nil {
 			return nil, err
 		}
+	}
+
+	// Adopt an existing container if present (the CLI semantics); the
+	// state file may have been left by a previous Create of this ID.
+	// Note the CLI contract: the loaded container keeps the spec it was
+	// created with (c.Spec), not opts.Spec. Only a fresh container needs
+	// its spec read from a bundle.
+	c, err := container.Load(r.conf.RootDir, container.FullID{ContainerID: opts.ID}, container.LoadOpts{})
+	if err == nil {
+		lc, err := r.adopt(c)
+		if err != nil {
+			return nil, err
+		}
+		if err := lc.Restore(opts); err != nil {
+			return nil, err
+		}
+		return lc, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("library: loading container %q: %w", opts.ID, err)
 	}
 
 	spec := opts.Spec
@@ -365,149 +374,47 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 		opts.BundleDir = bundleDir
 	}
 
-	// Adopt an existing container if present (the CLI semantics); the
-	// state file may have been left by a previous Create of this ID.
-	// Note the CLI contract: the loaded container keeps the spec it was
-	// created with (c.Spec), not opts.Spec; the spec read above is used
-	// only by the fresh-create path.
-	c, err := container.Load(r.conf.RootDir, container.FullID{ContainerID: opts.ID}, container.LoadOpts{})
-	if err == nil {
-		lc := &Container{rt: r, cont: c}
-		if err := lc.Restore(opts); err != nil {
+	rt, spec, bundle, err := r.prepareSpec(spec, opts.BundleDir)
+	if err != nil {
+		return nil, err
+	}
+	if opts.ExpectedCompatKey != "" {
+		if err := rt.checkCompatKey(opts.ExpectedCompatKey, opts.Driver); err != nil {
 			return nil, err
 		}
-		return lc, nil
 	}
-	if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("library: loading container %q: %w", opts.ID, err)
-	}
-
 	args := container.Args{
 		ID:              opts.ID,
 		Spec:            spec,
-		BundleDir:       opts.BundleDir,
+		BundleDir:       bundle,
 		ConsoleSocket:   opts.ConsoleSocket,
 		PIDFile:         opts.PIDFile,
 		UserLog:         opts.UserLog,
 		Attached:        opts.Attached,
+		IOFiles:         opts.GoferIOFiles,
+		EgressFile:      opts.EgressFile,
+		IngressFile:     opts.IngressFile,
 		PassFiles:       opts.PassFiles,
 		ExecFile:        opts.ExecFile,
 		FSRestoreDirect: opts.Direct,
 	}
-	ingressFile, err := duplicateFile(opts.IngressFile)
+	var donations fileDonations
+	defer donations.close()
+	if err := donations.acquire(&args); err != nil {
+		return nil, fmt.Errorf("library: %w", err)
+	}
+	c, err = container.New(rt.conf, args)
 	if err != nil {
-		return nil, fmt.Errorf("library: acquiring ingress file: %w", err)
-	}
-	if ingressFile != nil {
-		defer ingressFile.Close()
-		args.IngressFile = ingressFile
-	}
-	ioFDs, err := fileFDs(opts.GoferIOFiles)
-	if err != nil {
-		return nil, fmt.Errorf("library: acquiring gofer IO files: %w", err)
-	}
-	args.IOFDs = ioFDs
-	if args.EgressFD, err = fileFD(opts.EgressFile); err != nil {
-		closeFDs(ioFDs)
-		return nil, fmt.Errorf("library: acquiring egress file: %w", err)
-	}
-	if r.exePath != "" {
-		prev := specutils.ExePath
-		specutils.ExePath = r.exePath
-		defer func() { specutils.ExePath = prev }()
-	}
-	c, err = container.New(r.conf, args)
-	if err != nil {
-		closeFDs(filterNil(args.EgressFD, ioFDs))
 		return nil, fmt.Errorf("library: creating container %q for restore: %w", opts.ID, err)
 	}
-	lc := &Container{rt: r, cont: c}
-	if err := lc.Restore(opts); err != nil {
+	lc := &Container{rt: rt, cont: c}
+	if err := lc.restore(opts); err != nil {
 		// Mirror the CLI cleanup: destroy the partially created container.
 		if derr := c.Destroy(); derr != nil {
 			log.Warningf("library: destroying partially restored container %q: %v", opts.ID, derr)
 		}
 		return nil, err
 	}
+	donations.commit()
 	return lc, nil
-}
-
-// fileFDs converts donated files to the raw descriptor list container.Args
-// takes. Descriptor 0 is preserved (an explicit 0 is a valid donation; the
-// zero-value-vs-unset distinction is made by slice length, not FD number).
-func fileFDs(files []*os.File) ([]int, error) {
-	if len(files) == 0 {
-		return nil, nil
-	}
-	fds := make([]int, 0, len(files))
-	for _, f := range files {
-		fd, err := ownFD(f)
-		if err != nil {
-			for _, d := range fds {
-				unix.Close(d)
-			}
-			return nil, err
-		}
-		fds = append(fds, fd)
-	}
-	return fds, nil
-}
-
-// fileFD converts a single donated file, preserving descriptor 0; nil stays
-// nil (unset).
-func fileFD(f *os.File) (*int, error) {
-	if f == nil {
-		return nil, nil
-	}
-	fd, err := ownFD(f)
-	if err != nil {
-		return nil, err
-	}
-	return &fd, nil
-}
-
-// ownFD extracts the file descriptor of f and transfers ownership to the
-// library: the caller's *os.File is closed (disarming its finalizer), and a
-// dup of the descriptor is returned so the runtime's DonateAndClose path is
-// the single authoritative closer. Without this, the caller's GC finalizer
-// can double-close a descriptor number the runtime has already reused.
-func ownFD(f *os.File) (int, error) {
-	fd, err := unix.Dup(int(f.Fd()))
-	if err != nil {
-		return -1, fmt.Errorf("dup for donation: %w", err)
-	}
-	f.Close()
-	return fd, nil
-}
-
-// closeFDs closes the given descriptors, ignoring errors (cleanup path).
-func closeFDs(fds []int) {
-	for _, fd := range fds {
-		unix.Close(fd)
-	}
-}
-
-// filterNil returns the FD list with the nilable donation pointers
-// flattened ahead of the gofer IO FDs.
-func filterNil(egress *int, ioFDs []int) []int {
-	all := make([]int, 0, len(ioFDs)+1)
-	if egress != nil {
-		all = append(all, *egress)
-	}
-	all = append(all, ioFDs...)
-	return all
-}
-
-// duplicateFile borrows f and returns a separately owned donation. CLOEXEC keeps
-// the duplicate out of unrelated child processes created during container setup.
-func duplicateFile(f *os.File) (*os.File, error) {
-	if f == nil {
-		return nil, nil
-	}
-	fd, err := unix.FcntlInt(f.Fd(), unix.F_DUPFD_CLOEXEC, 0)
-	runtime.KeepAlive(f)
-	if err != nil {
-		return nil, err
-	}
-	return os.NewFile(uintptr(fd), "ingress-fd"), nil
 }
