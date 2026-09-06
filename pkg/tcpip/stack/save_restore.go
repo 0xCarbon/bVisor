@@ -48,7 +48,13 @@ func (s *Stack) beforeSave() {
 }
 
 // afterLoad is invoked by stateify.
-func (s *Stack) afterLoad(context.Context) {
+func (s *Stack) afterLoad(ctx context.Context) {
 	s.insecureRNG = rand.New(rand.NewSource(time.Now().UnixNano()))
 	s.secureRNG = cryptorand.RNGFrom(cryptorand.Reader)
+	// Re-attach the egress gate donated at restore time. The saved gate is
+	// nil (state:"nosave"); without this, restored stacks would silently
+	// run ungated even though restore accepted --egress-fd.
+	if g, ok := ctx.Value(CtxEgressGate{}).(EgressGate); ok {
+		s.egressGate = g
+	}
 }

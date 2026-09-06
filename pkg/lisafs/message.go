@@ -14,6 +14,8 @@
 
 package lisafs
 
+//go:generate go run ./abi_gen
+
 import (
 	"fmt"
 	"math"
@@ -57,6 +59,14 @@ import (
 type marshalFunc func([]byte) []byte
 type unmarshalFunc func([]byte) ([]byte, bool)
 type debugStringer func() string
+
+// LISAFSWireABI is the version of the LISAFS wire protocol implemented by
+// this package. It is frozen: MIDs 0-255 are reserved and may only be
+// appended to, never inserted, renumbered or removed, and existing message
+// layouts may not change. See ABI.md for the byte-level contract and its
+// machine checks. Bump only for an incompatible change (which requires a new
+// MID negotiation mechanism first).
+const LISAFSWireABI = 1
 
 // MID (message ID) is used to identify messages to parse from payload.
 //
@@ -911,7 +921,7 @@ func (r *PReadResp) MarshalBytes(dst []byte) []byte {
 // CheckedUnmarshal implements marshal.CheckedMarshallable.CheckedUnmarshal.
 func (r *PReadResp) CheckedUnmarshal(src []byte) ([]byte, bool) {
 	srcRemain, ok := r.NumBytes.CheckedUnmarshal(src)
-	if !ok || uint32(r.NumBytes) > uint32(len(srcRemain)) || uint32(r.NumBytes) > uint32(len(r.Buf)) {
+	if !ok || uint64(r.NumBytes) > uint64(len(srcRemain)) || uint64(r.NumBytes) > uint64(len(r.Buf)) {
 		return src, false
 	}
 

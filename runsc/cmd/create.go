@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -57,8 +58,28 @@ type Create struct {
 	fsRestoreImagePath string
 	fsRestoreDirect    bool
 
+	// ioFDs is an optional list of file descriptors for an external gofer.
+	// When set, runsc does not spawn its own gofer process; instead it uses
+	// these donated sandbox-side gofer-connection FDs (lisafs), one per
+	// gofer-backed mount in spec order (root first). This lets an embedder
+	// (e.g. Oca managed mode) serve the sandbox filesystem from its own gofer.
+	ioFDs sandboxsetup.IntFlags
+
+	// egressFD is the AF_UNIX FD to the Oca egress flow gate, or -1 when the
+	// egress data path is disabled (Oca #447). Re-donated to the sandbox.
+	egressFD int
+
 	// spec is the cached OCI spec.
 	spec *specs.Spec
+}
+
+// optionalFD preserves descriptor 0 as a valid explicit donation while making
+// the zero value of container.Args unambiguously mean "not configured".
+func optionalFD(fd int) *int {
+	if fd < 0 {
+		return nil
+	}
+	return &fd
 }
 
 // Name implements subcommands.Command.Name.
@@ -84,6 +105,8 @@ func (c *Create) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.userLog, "user-log", "", "filename to send user-visible logs to. Empty means no logging.")
 	f.StringVar(&c.fsRestoreImagePath, "fs-restore-image-path", "", "path to filesystem checkpoint to restore")
 	f.BoolVar(&c.fsRestoreDirect, "fs-restore-direct", false, "open files in fs-restore-image-path with O_DIRECT")
+	f.Var(&c.ioFDs, "io-fds", "list of FDs for an external gofer's sandbox-side connections (lisafs), in gofer-mount order (root first). When set, runsc does not spawn its own gofer and does not execute CreateContainer hooks; the external gofer/harness owns them (specs with CreateContainer hooks are rejected).")
+	f.IntVar(&c.egressFD, "egress-fd", -1, "AF_UNIX FD to the Oca egress flow gate (Oca #447), re-donated to the sandbox; -1 disables egress enforcement")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
@@ -136,6 +159,8 @@ func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcom
 		UserLog:            c.userLog,
 		FSRestoreImagePath: c.fsRestoreImagePath,
 		FSRestoreDirect:    c.fsRestoreDirect,
+		IOFDs:              c.ioFDs,
+		EgressFD:           optionalFD(c.egressFD),
 	}
 	if _, err := container.New(conf, contArgs); err != nil {
 		return util.Errorf("creating container: %v", err)

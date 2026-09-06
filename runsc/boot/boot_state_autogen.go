@@ -18,6 +18,7 @@ func (c *sandboxNetstackCreator) StateFields() []string {
 		"allowPacketEndpointWrite",
 		"allowLiveTCPMigration",
 		"uid",
+		"egressFD",
 	}
 }
 
@@ -30,9 +31,8 @@ func (c *sandboxNetstackCreator) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &c.allowPacketEndpointWrite)
 	stateSinkObject.Save(2, &c.allowLiveTCPMigration)
 	stateSinkObject.Save(3, &c.uid)
+	stateSinkObject.Save(4, &c.egressFD)
 }
-
-func (c *sandboxNetstackCreator) afterLoad(context.Context) {}
 
 // +checklocksignore
 func (c *sandboxNetstackCreator) StateLoad(ctx context.Context, stateSourceObject state.Source) {
@@ -40,6 +40,8 @@ func (c *sandboxNetstackCreator) StateLoad(ctx context.Context, stateSourceObjec
 	stateSourceObject.Load(1, &c.allowPacketEndpointWrite)
 	stateSourceObject.Load(2, &c.allowLiveTCPMigration)
 	stateSourceObject.Load(3, &c.uid)
+	stateSourceObject.Load(4, &c.egressFD)
+	stateSourceObject.AfterLoad(func() { c.afterLoad(ctx) })
 }
 
 func init() {

@@ -135,6 +135,15 @@ type MountHint struct {
 	// when --directfs is disabled because directfs requires some sandbox-wide
 	// settings (like seccomp filters) that can not be selectively enabled on
 	// containers.
+	//
+	// This is the per-mount no-host-FD capability (wave-04): embedders serving
+	// individual mounts from an external gofer (--io-fds, e.g. oca's managed
+	// mode) should annotate those mounts with "directfs=off" instead of
+	// forcing the global --directfs=false, so unrelated mounts keep host-FD
+	// access. The remaining external-gofer constraint is overlay2: self/anon
+	// overlay filestores are created by runsc's local gofer, so
+	// externally-served mounts must use overlay "none" or "memory" (per-mount
+	// via the mount annotations, or globally with --overlay2=none).
 	SuppressDirectFS bool `json:"suppressDirectFS"`
 }
 

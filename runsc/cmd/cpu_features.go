@@ -17,17 +17,26 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/runsc/cmd/util"
+	"gvisor.dev/gvisor/runsc/compat"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 )
 
 // CPUFeatures implements subcommands.Command for the "cpu-features" command.
-type CPUFeatures struct{}
+type CPUFeatures struct {
+	// compatKey prints the canonical restore-compatibility key instead of
+	// the raw feature list.
+	compatKey bool
+
+	// compatDriver supplies the optional GPU driver component of the
+	// compatibility key (e.g. a pinned NVIDIA driver branch); empty for CPU
+	// sandboxes. runsc does not probe the GPU driver host-side.
+	compatDriver string
+}
 
 // Name implements subcommands.command.name.
 func (*CPUFeatures) Name() string {
@@ -45,7 +54,10 @@ func (*CPUFeatures) Usage() string {
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
-func (*CPUFeatures) SetFlags(*flag.FlagSet) {}
+func (c *CPUFeatures) SetFlags(f *flag.FlagSet) {
+	f.BoolVar(&c.compatKey, "compat-key", false, "print the canonical restore-compatibility key (v1|build|platform|cpu-features-id|driver) instead of the feature list")
+	f.StringVar(&c.compatDriver, "compat-driver", "", "GPU driver component for --compat-key (e.g. the pinned NVIDIA driver branch); empty for CPU sandboxes")
+}
 
 // FetchSpec implements util.SubCommand.FetchSpec.
 func (*CPUFeatures) FetchSpec(_ *config.Config, _ *flag.FlagSet) (string, *specs.Spec, error) {
@@ -54,18 +66,17 @@ func (*CPUFeatures) FetchSpec(_ *config.Config, _ *flag.FlagSet) (string, *specs
 }
 
 // Execute implements subcommands.Command.Execute.
-func (*CPUFeatures) Execute(_ context.Context, _ *flag.FlagSet, args ...any) subcommands.ExitStatus {
-	cpuid.Initialize()
-	hfs := cpuid.HostFeatureSet().Fixed()
-	allFeatures := cpuid.AllFeatures()
-
-	features := []string{}
-	for _, v := range allFeatures {
-		if hfs.HasFeature(v) {
-			features = append(features, v.String())
+func (c *CPUFeatures) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
+	if c.compatKey {
+		conf, ok := args[0].(*config.Config)
+		if !ok {
+			util.Fatalf("missing config")
 		}
+		fmt.Println(compat.HostKey(conf.Platform, c.compatDriver).String())
+		return subcommands.ExitSuccess
 	}
-	fmt.Println(strings.Join(features, ","))
-
+	// The canonical feature list lives in one place so the compatibility
+	// key's digest and this output cannot drift.
+	fmt.Println(compat.CanonicalCPUFeatures())
 	return subcommands.ExitSuccess
 }

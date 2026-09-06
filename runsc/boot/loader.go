@@ -16,6 +16,7 @@
 package boot
 
 import (
+	stdcontext "context"
 	"errors"
 	"fmt"
 	"os"
@@ -38,6 +39,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/metric"
+	"gvisor.dev/gvisor/pkg/pinring"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/refs"
@@ -45,6 +47,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/devices/rdmaproxy/cxproxy"
+	"gvisor.dev/gvisor/pkg/sentry/devices/rdmaproxy/efaproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/rdmaproxy/genericproxy"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
 	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
@@ -54,6 +57,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/version"
 	"gvisor.dev/gvisor/pkg/sentry/loader"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -218,6 +222,11 @@ type Loader struct {
 	// k is the kernel.
 	k *kernel.Kernel
 
+	// egressGate is the live egress-gate client built from the donated
+	// --egress-fd during New. Restore re-injects it into the loaded kernel
+	// via stack.CtxEgressGate so the gate survives checkpoint/restore.
+	egressGate *egressGateClient
+
 	// ctrl is the control server.
 	ctrl *controller
 
@@ -281,8 +290,8 @@ type Loader struct {
 	sharedMounts map[string]*vfs.Mount
 
 	// cgroup2Mount is an internal mount of the cgroup2fs singleton used to
-	// manage per-container cgroups. It is only set when MountCgroupV2 is
-	// enabled.
+	// manage per-container cgroups. It is only set when InSandboxCgroup is
+	// InSandboxCgroupV2.
 	//
 	// +checklocks:mu
 	cgroup2Mount *vfs.Mount
@@ -339,6 +348,10 @@ type Loader struct {
 	// networkArgs contains the routes and links which were scraped from the
 	// host network namespace during sandbox creation.
 	networkArgs *CreateLinksAndRoutesArgs
+
+	// pinRing accumulates host FDs to pin before seccomp filters are
+	// installed.
+	pinRing pinring.PinRing
 
 	// fsSaveFDs are FDs used for user-triggered filesystem checkpoint saving.
 	fsSaveFDs []*fd.FD
@@ -406,6 +419,10 @@ type Args struct {
 	// ControllerFD is the FD to the URPC controller. The Loader takes ownership
 	// of this FD and may close it at any time.
 	ControllerFD int
+	// PinRingFD is the FD of the donated pin ring where the sentry registers
+	// its expensive-to-release files into. See `//pkg/pinring`.
+	// -1 if there is no ring.
+	PinRingFD int
 	// Device is an optional argument that is passed to the platform. The Loader
 	// takes ownership of this file and may close it at any time.
 	Device *fd.FD
@@ -423,6 +440,11 @@ type Args struct {
 	PassFDs []FDMapping
 	// ExecFD is the host file descriptor used for program execution.
 	ExecFD int
+
+	// EgressFD is the optional AF_UNIX FD to the Oca egress flow gate. A nil
+	// pointer disables the data path; an explicit descriptor 0 remains valid.
+	// The Loader takes ownership (Oca #447).
+	EgressFD *int
 	// GoferFilestoreFDs are FDs to the regular files that will back the tmpfs or
 	// overlayfs mount for certain gofer mounts.
 	GoferFilestoreFDs []int
@@ -545,6 +567,23 @@ func getRootCredentials(spec *specs.Spec, conf *config.Config, userNs *auth.User
 	return creds
 }
 
+// shouldEnableClockMonotonicRaw reports whether CLOCK_MONOTONIC_RAW should be
+// exposed as a distinct clock tracking the host's CLOCK_MONOTONIC_RAW, rather
+// than aliasing CLOCK_MONOTONIC as it does by default.
+//
+// This exists for GPU profiling: profilers such as Nsight Systems/CUPTI anchor
+// the GPU timeline in the host's CLOCK_MONOTONIC_RAW domain, which drifts from
+// CLOCK_MONOTONIC by NTP frequency adjustment. When nvproxy grants
+// CapProfiling, the sandbox must therefore serve a CLOCK_MONOTONIC_RAW in that
+// same (absolute, unadjusted) domain. It is enabled only in that case.
+func shouldEnableClockMonotonicRaw(spec *specs.Spec, conf *config.Config) bool {
+	if !specutils.NVProxyEnabled(spec, conf) {
+		return false
+	}
+	caps, err := specutils.NVProxyDriverCapsAllowed(conf)
+	return err == nil && caps&nvconf.CapProfiling != 0
+}
+
 // New initializes a new kernel loader configured by spec.
 // New also handles setting up a kernel for restoring a container.
 func New(args Args) (*Loader, error) {
@@ -576,7 +615,9 @@ func New(args Args) (*Loader, error) {
 	}
 	if specutils.RDMAEnabled(args.Spec, args.Conf) {
 		cxproxy.Init()
+		efaproxy.Init()
 		genericproxy.Init()
+		version.UseRDMARelease()
 		args.StartupTimer.Reached("RDMA proxy initialized")
 	}
 
@@ -696,7 +737,8 @@ func New(args Args) (*Loader, error) {
 	}
 
 	// Create kernel and platform.
-	p, err := createPlatform(args.Conf, args.NumCPU, args.Device, args.ID, args.StartupTimer)
+	l.pinRing.FD = args.PinRingFD
+	p, err := createPlatform(args.Conf, args.NumCPU, args.Device, args.ID, args.StartupTimer, &l.pinRing)
 	if err != nil {
 		return nil, fmt.Errorf("creating platform: %w", err)
 	}
@@ -733,7 +775,7 @@ func New(args Args) (*Loader, error) {
 	// Create timekeeper.
 	tk := kernel.NewTimekeeper()
 	params := kernel.NewVDSOParamPage(l.k.MemoryFile(), vdso.ParamPage.FileRange())
-	tk.SetClocks(time.NewCalibratedClocks(), params)
+	tk.SetClocks(time.NewCalibratedClocks(shouldEnableClockMonotonicRaw(args.Spec, args.Conf)), params)
 	args.StartupTimer.Reached("timekeeper configured")
 
 	if err := enableStrace(args.Conf); err != nil {
@@ -745,9 +787,12 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("getting root credentials")
 	}
 	// Create root network namespace/stack.
-	netns, err := newRootNetworkNamespace(args.Conf, tk, creds.UserNamespace, l.k)
+	netns, creator, err := newRootNetworkNamespace(args.Conf, tk, creds.UserNamespace, l.k, args.EgressFD)
 	if err != nil {
 		return nil, fmt.Errorf("creating network: %w", err)
+	}
+	if creator != nil {
+		l.egressGate = creator.egressGate
 	}
 	args.StartupTimer.Reached("network stack created")
 
@@ -1052,7 +1097,7 @@ func (l *Loader) Destroy() {
 	refs.OnExit()
 }
 
-func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxID string, startupTimer *timing.Timer) (platform.Platform, error) {
+func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxID string, startupTimer *timing.Timer, pinRing *pinring.PinRing) (platform.Platform, error) {
 	platformName := conf.Platform
 	p, err := platform.Lookup(conf.Platform)
 	if err != nil {
@@ -1068,6 +1113,7 @@ func createPlatform(conf *config.Config, numCPU int, deviceFile *fd.FD, sandboxI
 		UseCPUNums:             platformName == "kvm" && conf.UseCPUNums,
 		SandboxID:              sandboxID,
 		StartupTimer:           startupTimer,
+		PinRing:                pinRing,
 	})
 }
 
@@ -1227,6 +1273,10 @@ func (l *Loader) run() error {
 				return err
 			}
 			l.startupTimer.Reached("network configured")
+		}
+
+		if err := l.pinRing.Finalize(); err != nil {
+			log.Warningf("Cannot pin files to the pin ring: %v. This slows down gVisor sandbox teardown.", err)
 		}
 
 		// Finally done with all configuration. Setup filters before user code
@@ -1498,7 +1548,7 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	l.startGoferMonitor(info)
 
 	if l.root.cid == l.sandboxID {
-		if l.root.conf.MountCgroupV2 {
+		if l.root.conf.InSandboxCgroup == config.InSandboxCgroupV2 {
 			if err := l.setupCgroup2(); err != nil {
 				return nil, nil, err
 			}
@@ -1509,7 +1559,7 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 			}
 		}
 	}
-	if l.root.conf.MountCgroupV2 {
+	if l.root.conf.InSandboxCgroup == config.InSandboxCgroupV2 {
 		// Create the container's cgroup and resolve its cgroup namespace
 		// before the container's mounts are set up, so that its
 		// /sys/fs/cgroup mount is rooted per the namespace.
@@ -1603,16 +1653,31 @@ func (l *Loader) startGoferMonitor(info *containerInfo) {
 			panic(fmt.Sprintf("Error monitoring gofer FDs: %s", err))
 		}
 
-		l.mu.Lock()
-		defer l.mu.Unlock()
-
-		// The gofer could have been stopped due to a normal container shutdown.
-		// Check if the container has not stopped yet.
-		if tg, _ := l.tryThreadGroupFromIDLocked(execID{cid: info.cid}); tg != nil {
-			log.Infof("Gofer socket disconnected, killing container %q", info.cid)
-			if err := l.signalAllProcesses(info.cid, int32(linux.SIGKILL)); err != nil {
-				log.Warningf("Error killing container %q after gofer stopped: %s", info.cid, err)
+		// External-gofer teardown race (Oca #358): the gofer connection can
+		// disconnect a moment before the init task is fully reaped during a
+		// NORMAL container exit. Give the container a short grace period to stop
+		// before treating the disconnect as a gofer failure worth SIGKILLing over
+		// — otherwise we kill a cleanly-exiting container, corrupt the control
+		// server, and leave runsc state stuck at "running". A genuinely dead
+		// gofer (container still running after the grace) is still killed.
+		deadline := gtime.Now().Add(2 * gtime.Second)
+		for {
+			l.mu.Lock()
+			tg, _ := l.tryThreadGroupFromIDLocked(execID{cid: info.cid})
+			if tg == nil {
+				l.mu.Unlock()
+				return
 			}
+			if gtime.Now().After(deadline) {
+				log.Infof("Gofer socket disconnected, killing container %q", info.cid)
+				if err := l.signalAllProcesses(info.cid, int32(linux.SIGKILL)); err != nil {
+					log.Warningf("Error killing container %q after gofer stopped: %s", info.cid, err)
+				}
+				l.mu.Unlock()
+				return
+			}
+			l.mu.Unlock()
+			gtime.Sleep(50 * gtime.Millisecond)
 		}
 	}()
 }
@@ -1654,7 +1719,7 @@ func (l *Loader) destroySubcontainer(cid string) error {
 	// Cleanup the device gofer.
 	l.k.RemoveDevGofer(l.k.ContainerName(cid))
 
-	if l.root.conf.MountCgroupV2 {
+	if l.root.conf.InSandboxCgroup == config.InSandboxCgroupV2 {
 		l.removeContainerCgroup2(cid)
 	}
 
@@ -1701,7 +1766,7 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 	}
 	args.PIDNamespace = tg.PIDNamespace()
 
-	if l.root.conf.MountCgroupV2 {
+	if l.root.conf.InSandboxCgroup == config.InSandboxCgroupV2 {
 		// Join the container's cgroup and cgroup namespace, like Linux's
 		// runc exec does.
 		leader := tg.Leader()
@@ -1870,7 +1935,21 @@ func (l *Loader) WaitExit() linux.WaitStatus {
 	return l.k.GlobalInit().ExitStatus()
 }
 
-func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, userns *auth.UserNamespace, uid uniqueid.Provider) (*inet.Namespace, error) {
+func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, userns *auth.UserNamespace, uid uniqueid.Provider, egressFD *int) (*inet.Namespace, *sandboxNetstackCreator, error) {
+	// The egress gate must fail closed: reject any configuration whose
+	// egress would bypass it instead of silently accepting --egress-fd.
+	if egressFD != nil {
+		switch conf.Network {
+		case config.NetworkHost, config.NetworkPlugin:
+			return nil, nil, fmt.Errorf("--egress-fd requires network=sandbox; %s networking bypasses the egress gate", conf.Network)
+		}
+		if conf.EnableRaw {
+			return nil, nil, fmt.Errorf("--egress-fd is incompatible with --net-raw (ungated raw-socket egress)")
+		}
+		if conf.AllowPacketEndpointWrite {
+			return nil, nil, fmt.Errorf("--egress-fd is incompatible with --allow-packet-socket-write (ungated packet-socket egress)")
+		}
+	}
 	// Create an empty network stack because the network namespace may be empty at
 	// this point. Netns is configured before Run() is called. Netstack is
 	// configured using a control uRPC message. Host network is configured inside
@@ -1881,10 +1960,10 @@ func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, userns *aut
 		// stack, make sure that we have CAP_NET_RAW the host,
 		// otherwise we can't make raw sockets.
 		if conf.EnableRaw && !specutils.HasCapabilities(capability.CAP_NET_RAW) {
-			return nil, fmt.Errorf("configuring network=host with raw sockets requires CAP_NET_RAW capability")
+			return nil, nil, fmt.Errorf("configuring network=host with raw sockets requires CAP_NET_RAW capability")
 		}
 		// No network namespacing support for hostinet yet, hence creator is nil.
-		return inet.NewRootNamespace(hostinet.NewStack(), nil, userns), nil
+		return inet.NewRootNamespace(hostinet.NewStack(), nil, userns), nil, nil
 
 	case config.NetworkNone, config.NetworkSandbox:
 		creator := &sandboxNetstackCreator{
@@ -1892,14 +1971,15 @@ func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, userns *aut
 			allowPacketEndpointWrite: conf.AllowPacketEndpointWrite,
 			allowLiveTCPMigration:    conf.AllowLiveTCPMigration,
 			uid:                      uid,
+			egressFD:                 egressFD,
 		}
 		s, err := creator.newEmptySandboxNetworkStack()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return inet.NewRootNamespace(s, creator, userns), nil
+		return inet.NewRootNamespace(s, creator, userns), creator, nil
 	case config.NetworkPlugin:
-		return inet.NewRootNamespace(plugin.GetPluginStack(), nil, userns), nil
+		return inet.NewRootNamespace(plugin.GetPluginStack(), nil, userns), nil, nil
 
 	default:
 		panic(fmt.Sprintf("invalid network configuration: %v", conf.Network))
@@ -1915,6 +1995,22 @@ func (c *sandboxNetstackCreator) newEmptySandboxNetworkStack() (*netstack.Stack,
 		icmp.NewProtocol4,
 		icmp.NewProtocol6,
 	}
+	if c.egressGateMissing {
+		return nil, fmt.Errorf("checkpoint was created with an egress gate; restore must donate --egress-fd")
+	}
+	if c.egressGate == nil && c.egressFD != nil {
+		// First stack for this creator: consume the donated FD exactly
+		// once and keep the live client for every later namespace.
+		gateClient, err := newEgressGateClient(*c.egressFD)
+		if err != nil {
+			return nil, fmt.Errorf("oca egress gate: %w", err)
+		}
+		c.egressGate = gateClient
+	}
+	var egressGate stack.EgressGate
+	if c.egressGate != nil {
+		egressGate = c.egressGate
+	}
 	s := netstack.NewStack(stack.New(stack.Options{
 		NetworkProtocols:   netProtos,
 		TransportProtocols: transProtos,
@@ -1927,6 +2023,7 @@ func (c *sandboxNetstackCreator) newEmptySandboxNetworkStack() (*netstack.Stack,
 		AllowPacketEndpointWrite: c.allowPacketEndpointWrite,
 		AllowLiveTCPMigration:    c.allowLiveTCPMigration,
 		DefaultIPTables:          netfilter.DefaultLinuxTables,
+		EgressGate:               egressGate,
 	}), c.uid.UniqueID())
 
 	if nftables.IsNFTablesEnabled() {
@@ -1971,6 +2068,38 @@ type sandboxNetstackCreator struct {
 	allowPacketEndpointWrite bool
 	allowLiveTCPMigration    bool
 	uid                      uniqueid.Provider
+	egressFD                 *int // Oca #447: nil when disabled
+
+	// egressGate is the single live gate client shared by every stack this
+	// creator builds. The donated FD is consumed exactly once (dup + close
+	// in newEgressGateClient), so re-opening it per network namespace would
+	// hit EBADF; keep the live client instead. Not saved: on restore it is
+	// re-injected from CtxEgressGate by afterLoad.
+	egressGate *egressGateClient `state:"nosave"`
+	// egressGateMissing is set by afterLoad when the checkpoint enforced an
+	// egress gate but the restore did not donate one. Fail closed in
+	// CreateStack instead of silently running ungated (or worse, gating on
+	// a recycled FD number).
+	egressGateMissing bool `state:"nosave"`
+}
+
+// afterLoad is invoked by stateify.
+func (c *sandboxNetstackCreator) afterLoad(ctx stdcontext.Context) {
+	if c.egressGate != nil {
+		return
+	}
+	if g, ok := ctx.Value(stack.CtxEgressGate{}).(*egressGateClient); ok && g != nil {
+		// The restored creator keeps sharing the live client donated at
+		// restore time; this covers the root namespace and every network
+		// namespace restored from the checkpoint.
+		c.egressGate = g
+		return
+	}
+	if c.egressFD != nil {
+		// The checkpoint was taken with egress enforcement; restoring it
+		// without --egress-fd must not silently drop enforcement.
+		c.egressGateMissing = true
+	}
 }
 
 // CreateStack implements kernel.NetworkStackCreator.CreateStack.
@@ -2338,9 +2467,9 @@ func (l *Loader) containerCount() int {
 
 func (l *Loader) pidsCount(cid string) (int, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if _, err := l.tryThreadGroupFromIDLocked(execID{cid: cid}); err != nil {
+	_, err := l.tryThreadGroupFromIDLocked(execID{cid: cid})
+	l.mu.Unlock()
+	if err != nil {
 		// Container doesn't exist.
 		return 0, err
 	}

@@ -220,6 +220,14 @@ func (r *RegisterDeviceOptions) StateLoad(ctx context.Context, stateSourceObject
 	stateSourceObject.Load(2, &r.FilePerms)
 }
 
+func (s *SharedDynamicCharDevMajorKey) StateTypeName() string {
+	return "pkg/sentry/vfs.SharedDynamicCharDevMajorKey"
+}
+
+func (s *SharedDynamicCharDevMajorKey) StateFields() []string {
+	return nil
+}
+
 func (ep *EpollInstance) StateTypeName() string {
 	return "pkg/sentry/vfs.EpollInstance"
 }
@@ -232,7 +240,6 @@ func (ep *EpollInstance) StateFields() []string {
 		"NoLockFD",
 		"q",
 		"interest",
-		"ready",
 		"readySeq",
 	}
 }
@@ -248,8 +255,7 @@ func (ep *EpollInstance) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(3, &ep.NoLockFD)
 	stateSinkObject.Save(4, &ep.q)
 	stateSinkObject.Save(5, &ep.interest)
-	stateSinkObject.Save(6, &ep.ready)
-	stateSinkObject.Save(7, &ep.readySeq)
+	stateSinkObject.Save(6, &ep.readySeq)
 }
 
 func (ep *EpollInstance) afterLoad(context.Context) {}
@@ -262,8 +268,7 @@ func (ep *EpollInstance) StateLoad(ctx context.Context, stateSourceObject state.
 	stateSourceObject.Load(3, &ep.NoLockFD)
 	stateSourceObject.Load(4, &ep.q)
 	stateSourceObject.Load(5, &ep.interest)
-	stateSourceObject.Load(6, &ep.ready)
-	stateSourceObject.Load(7, &ep.readySeq)
+	stateSourceObject.Load(6, &ep.readySeq)
 }
 
 func (e *epollInterestKey) StateTypeName() string {
@@ -304,9 +309,6 @@ func (epi *epollInterest) StateFields() []string {
 		"key",
 		"waiter",
 		"mask",
-		"ready",
-		"epollInterestEntry",
-		"readySeq",
 		"userData",
 	}
 }
@@ -320,10 +322,7 @@ func (epi *epollInterest) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &epi.key)
 	stateSinkObject.Save(2, &epi.waiter)
 	stateSinkObject.Save(3, &epi.mask)
-	stateSinkObject.Save(4, &epi.ready)
-	stateSinkObject.Save(5, &epi.epollInterestEntry)
-	stateSinkObject.Save(6, &epi.readySeq)
-	stateSinkObject.Save(7, &epi.userData)
+	stateSinkObject.Save(4, &epi.userData)
 }
 
 // +checklocksignore
@@ -332,10 +331,7 @@ func (epi *epollInterest) StateLoad(ctx context.Context, stateSourceObject state
 	stateSourceObject.Load(1, &epi.key)
 	stateSourceObject.Load(2, &epi.waiter)
 	stateSourceObject.Load(3, &epi.mask)
-	stateSourceObject.Load(4, &epi.ready)
-	stateSourceObject.Load(5, &epi.epollInterestEntry)
-	stateSourceObject.Load(6, &epi.readySeq)
-	stateSourceObject.Load(7, &epi.userData)
+	stateSourceObject.Load(4, &epi.userData)
 	stateSourceObject.AfterLoad(func() { epi.afterLoad(ctx) })
 }
 
@@ -2085,6 +2081,8 @@ func (rp *ResolvingPath) StateFields() []string {
 		"nextStart",
 		"absSymlinkTarget",
 		"parts",
+		"mountSeq",
+		"renameState",
 	}
 }
 
@@ -2107,6 +2105,8 @@ func (rp *ResolvingPath) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(11, &rp.nextStart)
 	stateSinkObject.Save(12, &rp.absSymlinkTarget)
 	stateSinkObject.Save(13, &rp.parts)
+	stateSinkObject.Save(14, &rp.mountSeq)
+	stateSinkObject.Save(15, &rp.renameState)
 }
 
 func (rp *ResolvingPath) afterLoad(context.Context) {}
@@ -2127,6 +2127,8 @@ func (rp *ResolvingPath) StateLoad(ctx context.Context, stateSourceObject state.
 	stateSourceObject.Load(11, &rp.nextStart)
 	stateSourceObject.Load(12, &rp.absSymlinkTarget)
 	stateSourceObject.Load(13, &rp.parts)
+	stateSourceObject.Load(14, &rp.mountSeq)
+	stateSourceObject.Load(15, &rp.renameState)
 }
 
 func (r *resolveMountRootOrJumpError) StateTypeName() string {
@@ -2202,9 +2204,11 @@ func (vfs *VirtualFilesystem) StateFields() []string {
 		"mountpoints",
 		"lastMountID",
 		"lastMountNamespaceID",
+		"MountMax",
 		"anonMount",
 		"devices",
 		"dynCharDevMajorUsed",
+		"dynCharDevMajorShared",
 		"anonBlockDevMinorNext",
 		"anonBlockDevMinor",
 		"fsTypes",
@@ -2212,6 +2216,7 @@ func (vfs *VirtualFilesystem) StateFields() []string {
 		"groupIDBitmap",
 		"mountPromises",
 		"toDecRef",
+		"renameState",
 	}
 }
 
@@ -2225,73 +2230,81 @@ func (vfs *VirtualFilesystem) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.SaveValue(0, mountsValue)
 	mountPromisesValue := vfs.saveMountPromises()
 	_ = (map[VirtualDentry]*mountPromise)(mountPromisesValue)
-	stateSinkObject.SaveValue(12, mountPromisesValue)
+	stateSinkObject.SaveValue(14, mountPromisesValue)
 	stateSinkObject.Save(1, &vfs.mountpoints)
 	stateSinkObject.Save(2, &vfs.lastMountID)
 	stateSinkObject.Save(3, &vfs.lastMountNamespaceID)
-	stateSinkObject.Save(4, &vfs.anonMount)
-	stateSinkObject.Save(5, &vfs.devices)
-	stateSinkObject.Save(6, &vfs.dynCharDevMajorUsed)
-	stateSinkObject.Save(7, &vfs.anonBlockDevMinorNext)
-	stateSinkObject.Save(8, &vfs.anonBlockDevMinor)
-	stateSinkObject.Save(9, &vfs.fsTypes)
-	stateSinkObject.Save(10, &vfs.filesystems)
-	stateSinkObject.Save(11, &vfs.groupIDBitmap)
-	stateSinkObject.Save(13, &vfs.toDecRef)
+	stateSinkObject.Save(4, &vfs.MountMax)
+	stateSinkObject.Save(5, &vfs.anonMount)
+	stateSinkObject.Save(6, &vfs.devices)
+	stateSinkObject.Save(7, &vfs.dynCharDevMajorUsed)
+	stateSinkObject.Save(8, &vfs.dynCharDevMajorShared)
+	stateSinkObject.Save(9, &vfs.anonBlockDevMinorNext)
+	stateSinkObject.Save(10, &vfs.anonBlockDevMinor)
+	stateSinkObject.Save(11, &vfs.fsTypes)
+	stateSinkObject.Save(12, &vfs.filesystems)
+	stateSinkObject.Save(13, &vfs.groupIDBitmap)
+	stateSinkObject.Save(15, &vfs.toDecRef)
+	stateSinkObject.Save(16, &vfs.renameState)
 }
-
-func (vfs *VirtualFilesystem) afterLoad(context.Context) {}
 
 // +checklocksignore
 func (vfs *VirtualFilesystem) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(1, &vfs.mountpoints)
 	stateSourceObject.Load(2, &vfs.lastMountID)
 	stateSourceObject.Load(3, &vfs.lastMountNamespaceID)
-	stateSourceObject.Load(4, &vfs.anonMount)
-	stateSourceObject.Load(5, &vfs.devices)
-	stateSourceObject.Load(6, &vfs.dynCharDevMajorUsed)
-	stateSourceObject.Load(7, &vfs.anonBlockDevMinorNext)
-	stateSourceObject.Load(8, &vfs.anonBlockDevMinor)
-	stateSourceObject.Load(9, &vfs.fsTypes)
-	stateSourceObject.Load(10, &vfs.filesystems)
-	stateSourceObject.Load(11, &vfs.groupIDBitmap)
-	stateSourceObject.Load(13, &vfs.toDecRef)
+	stateSourceObject.Load(4, &vfs.MountMax)
+	stateSourceObject.Load(5, &vfs.anonMount)
+	stateSourceObject.Load(6, &vfs.devices)
+	stateSourceObject.Load(7, &vfs.dynCharDevMajorUsed)
+	stateSourceObject.Load(8, &vfs.dynCharDevMajorShared)
+	stateSourceObject.Load(9, &vfs.anonBlockDevMinorNext)
+	stateSourceObject.Load(10, &vfs.anonBlockDevMinor)
+	stateSourceObject.Load(11, &vfs.fsTypes)
+	stateSourceObject.Load(12, &vfs.filesystems)
+	stateSourceObject.Load(13, &vfs.groupIDBitmap)
+	stateSourceObject.Load(15, &vfs.toDecRef)
+	stateSourceObject.Load(16, &vfs.renameState)
 	stateSourceObject.LoadValue(0, new([]*Mount), func(y any) { vfs.loadMounts(ctx, y.([]*Mount)) })
-	stateSourceObject.LoadValue(12, new(map[VirtualDentry]*mountPromise), func(y any) { vfs.loadMountPromises(ctx, y.(map[VirtualDentry]*mountPromise)) })
+	stateSourceObject.LoadValue(14, new(map[VirtualDentry]*mountPromise), func(y any) { vfs.loadMountPromises(ctx, y.(map[VirtualDentry]*mountPromise)) })
+	stateSourceObject.AfterLoad(func() { vfs.afterLoad(ctx) })
 }
 
-func (p *PathOperation) StateTypeName() string {
+func (pop *PathOperation) StateTypeName() string {
 	return "pkg/sentry/vfs.PathOperation"
 }
 
-func (p *PathOperation) StateFields() []string {
+func (pop *PathOperation) StateFields() []string {
 	return []string{
 		"Root",
 		"Start",
 		"Path",
 		"FollowFinalSymlink",
+		"ResolveFlags",
 	}
 }
 
-func (p *PathOperation) beforeSave() {}
+func (pop *PathOperation) beforeSave() {}
 
 // +checklocksignore
-func (p *PathOperation) StateSave(stateSinkObject state.Sink) {
-	p.beforeSave()
-	stateSinkObject.Save(0, &p.Root)
-	stateSinkObject.Save(1, &p.Start)
-	stateSinkObject.Save(2, &p.Path)
-	stateSinkObject.Save(3, &p.FollowFinalSymlink)
+func (pop *PathOperation) StateSave(stateSinkObject state.Sink) {
+	pop.beforeSave()
+	stateSinkObject.Save(0, &pop.Root)
+	stateSinkObject.Save(1, &pop.Start)
+	stateSinkObject.Save(2, &pop.Path)
+	stateSinkObject.Save(3, &pop.FollowFinalSymlink)
+	stateSinkObject.Save(4, &pop.ResolveFlags)
 }
 
-func (p *PathOperation) afterLoad(context.Context) {}
+func (pop *PathOperation) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (p *PathOperation) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &p.Root)
-	stateSourceObject.Load(1, &p.Start)
-	stateSourceObject.Load(2, &p.Path)
-	stateSourceObject.Load(3, &p.FollowFinalSymlink)
+func (pop *PathOperation) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &pop.Root)
+	stateSourceObject.Load(1, &pop.Start)
+	stateSourceObject.Load(2, &pop.Path)
+	stateSourceObject.Load(3, &pop.FollowFinalSymlink)
+	stateSourceObject.Load(4, &pop.ResolveFlags)
 }
 
 func (vd *VirtualDentry) StateTypeName() string {
@@ -2331,6 +2344,7 @@ func init() {
 	state.Register((*devTuple)(nil))
 	state.Register((*registeredDevice)(nil))
 	state.Register((*RegisterDeviceOptions)(nil))
+	state.Register((*SharedDynamicCharDevMajorKey)(nil))
 	state.Register((*EpollInstance)(nil))
 	state.Register((*epollInterestKey)(nil))
 	state.Register((*epollInterest)(nil))

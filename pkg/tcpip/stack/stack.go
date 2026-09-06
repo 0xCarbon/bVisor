@@ -121,6 +121,15 @@ type Stack struct {
 	// TODO(gvisor.dev/issue/4595): S/R this field.
 	tables *IPTables `state:"nosave"`
 
+	// egressGate, when non-nil, gates outbound TCP/UDP flows (Oca #447).
+	egressGate EgressGate `state:"nosave"`
+
+	// egressGated records that this stack was created with an egress gate
+	// installed. It survives checkpoint/restore (unlike the gate itself)
+	// so a restore that does not donate a live gate can be rejected
+	// instead of silently coming back up ungated.
+	egressGated bool
+
 	// nftables is the nftables interface for packet filtering and manipulation rules.
 	// Using atomic.Pointer for RCU lock-free reads.
 	nftables atomic.Pointer[NFTablesInterface] `state:"nosave"`
@@ -282,6 +291,11 @@ type Options struct {
 
 	// SecureRNG is a cryptographically secure random number generator.
 	SecureRNG io.Reader
+
+	// EgressGate, when non-nil, is consulted before every outbound TCP
+	// connect and every outbound UDP datagram; returning a non-nil error
+	// denies the flow. Oca #447: the patched-runsc netstack egress gate.
+	EgressGate EgressGate
 }
 
 // TransportEndpointInfo holds useful information about a transport endpoint
@@ -427,6 +441,8 @@ func New(opts Options) *Stack {
 		stats:                        opts.Stats.FillIn(),
 		handleLocal:                  opts.HandleLocal,
 		tables:                       opts.IPTables,
+		egressGate:                   opts.EgressGate,
+		egressGated:                  opts.EgressGate != nil,
 		icmpRateLimiter:              NewICMPRateLimiter(clock),
 		seed:                         secureRNG.Uint32(),
 		nudConfigs:                   opts.NUDConfigs,
@@ -760,12 +776,16 @@ func (s *Stack) NICMulticastForwarding(id tcpip.NICID, protocol tcpip.NetworkPro
 
 // PortRange returns the UDP and TCP inclusive range of ephemeral ports used in
 // both IPv4 and IPv6.
+//
+// +checklocksexclude:s.PortManager.ephemeralMu
 func (s *Stack) PortRange() (uint16, uint16) {
 	return s.PortManager.PortRange()
 }
 
 // SetPortRange sets the UDP and TCP IPv4 and IPv6 ephemeral port range
 // (inclusive).
+//
+// +checklocksexclude:s.PortManager.ephemeralMu
 func (s *Stack) SetPortRange(start uint16, end uint16) tcpip.Error {
 	return s.PortManager.SetPortRange(start, end)
 }
@@ -2338,6 +2358,35 @@ func (s *Stack) IsInGroup(nicID tcpip.NICID, multicastAddr tcpip.Address) (bool,
 func (s *Stack) IPTables() *IPTables {
 	return s.tables
 }
+
+// EgressGate is consulted by the netstack before an outbound TCP connect,
+// before each outbound UDP datagram, and before releasing the initial payload
+// of an admitted outbound TCP flow when set via Options.EgressGate. Returning a
+// non-nil tcpip.Error denies the flow (Oca #447/#448).
+type EgressGate interface {
+	CheckTCP(dst tcpip.FullAddress) tcpip.Error
+	CheckUDP(dst tcpip.FullAddress) tcpip.Error
+	// CheckL7 classifies the accumulated prefix of an outbound TCP flow.
+	// needMore is true only when no decision is possible from prefix yet.
+	CheckL7(dst tcpip.FullAddress, prefix []byte) (needMore bool, err tcpip.Error)
+}
+
+// EgressGate returns the stack's egress gate, or nil if none is set.
+func (s *Stack) EgressGate() EgressGate {
+	return s.egressGate
+}
+
+// EgressGated reports whether the stack was created with an egress gate
+// (which may since have been restored away to nil; see CtxEgressGate).
+func (s *Stack) EgressGated() bool {
+	return s.egressGated
+}
+
+// CtxEgressGate is a context key carrying the live EgressGate to install on a
+// restored Stack. The gate itself is state:"nosave" (its socket cannot cross a
+// checkpoint file), so restore re-injects it via this key: Stack.afterLoad and
+// any stack-creator afterLoad pick it up while the state is loaded.
+type CtxEgressGate struct{}
 
 // SetIPTables sets the stack's iptables.
 func (s *Stack) SetIPTables(tables *IPTables) {

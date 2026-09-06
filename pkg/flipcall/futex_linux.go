@@ -86,3 +86,20 @@ func yieldThread() {
 	// runtime.Gosched() will hand off ours if necessary.
 	runtime.Gosched()
 }
+
+// futexSleeper adapts the Linux futex(2) control-transfer implementation to
+// the Sleeper seam (seam.go). The Endpoint keeps calling the concrete
+// futex* methods directly; the adapter exists for consumers of the seam.
+type futexSleeper struct {
+	ep *Endpoint
+}
+
+// Sleeper returns the Linux futex(2) implementation of the Sleeper seam for
+// ep's connection-state control word (packet window offset 0).
+func (ep *Endpoint) Sleeper() Sleeper { return futexSleeper{ep: ep} }
+
+// Wake implements Sleeper.Wake.
+func (s futexSleeper) Wake(n int32) error { return s.ep.futexWakeConnState(n) }
+
+// Wait implements Sleeper.Wait.
+func (s futexSleeper) Wait(cur uint32) error { return s.ep.futexWaitConnState(cur) }

@@ -30,6 +30,11 @@ import (
 )
 
 // MakeResourceID creates a ResourceID for a given application FD. The
+// ResourceID is the save/restore wire key for host resources backing guest
+// descriptors: at restore, a newly donated host FD is re-bound to the saved
+// host inode whose ResourceID matches (containerName, "host:<fd>"). See the
+// re-donation contract documented at the fdmap construction in
+// runsc/boot/restore.go (keyed by container name + descriptor number).
 // application FD remains the same between restores, e.g. stdout=2 before and
 // after restore, but the host FD that is maps to can change between restores.
 // This ID is used to map application FDs to their respective FD after a

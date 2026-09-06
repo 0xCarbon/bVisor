@@ -15,13 +15,16 @@
 package boot
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
@@ -631,4 +634,175 @@ func ipToAddress(ip net.IP) tcpip.Address {
 func ipMaskToAddressMask(ipMask net.IPMask) tcpip.AddressMask {
 	addr := ipToAddress(net.IP(ipMask))
 	return tcpip.MaskFromBytes(addr.AsSlice())
+}
+
+// --- Egress flow gate (Oca #447) ---------------------------------------------
+//
+// egressGateClient is the Sentry-side client of the Oca egress data path. Oca
+// donates one AF_UNIX stream FD (--egress-fd); for every outbound TCP connect
+// and every outbound UDP datagram the netstack calls CheckTCP/CheckUDP, which
+// sends a compact flow descriptor over that FD and blocks for a one-byte verdict
+// from the host Oca process (which runs the real Resolver — the single source of
+// truth for policy, the DNS-derived allowlist, and the operator floor). No
+// policy logic is duplicated here; this only marshals the flow tuple.
+//
+// FAIL-CLOSED is the contract: any framing/IO/timeout error denies the flow AND
+// marks the connection dead, so no later flow is ever judged by a stale verdict
+// (a reused conn could read flow N's late reply as flow N+1's verdict). The host
+// handlers never block on IO (pure policy checks), so the per-flow round-trip
+// under the caller's endpoint lock is bounded. The wire format mirrors
+// github.com/0xCarbon/oca/network (gate.go) byte-for-byte; the leading version
+// byte makes any drift fail closed instead of misparsing the tuple.
+const (
+	egressGateProtocolVersion = 1
+	egressGateKindTCP         = 1
+	egressGateKindUDP         = 2
+	egressGateKindL7          = 3
+	egressGateVerdictAllow    = 1
+	egressGateVerdictNeedMore = 2
+	egressGateL7SniffLimit    = 32 * 1024
+	egressGateCallTimeout     = 2 * time.Second
+)
+
+type egressGateClient struct {
+	mu   sync.Mutex
+	conn net.Conn
+	dead bool
+}
+
+func newEgressGateClient(fd int) (*egressGateClient, error) {
+	f := os.NewFile(uintptr(fd), "oca-egress-fd")
+	if f == nil {
+		return nil, fmt.Errorf("oca egress: invalid fd %d", fd)
+	}
+	conn, err := net.FileConn(f)
+	f.Close()
+	if err != nil {
+		return nil, fmt.Errorf("oca egress: FileConn(fd=%d): %w", fd, err)
+	}
+	return &egressGateClient{conn: conn}, nil
+}
+
+// CheckTCP implements stack.EgressGate.
+func (c *egressGateClient) CheckTCP(dst tcpip.FullAddress) tcpip.Error {
+	verdict, err := c.check(egressGateKindTCP, dst, nil)
+	if err != nil || verdict != egressGateVerdictAllow {
+		return &tcpip.ErrConnectionRefused{}
+	}
+	return nil
+}
+
+// CheckUDP implements stack.EgressGate.
+func (c *egressGateClient) CheckUDP(dst tcpip.FullAddress) tcpip.Error {
+	verdict, err := c.check(egressGateKindUDP, dst, nil)
+	if err != nil || verdict != egressGateVerdictAllow {
+		return &tcpip.ErrConnectionRefused{}
+	}
+	return nil
+}
+
+// CheckL7 implements stack.EgressGate. prefix is the complete accumulated
+// first-write prefix, not a delta, and is bounded by the TCP endpoint.
+func (c *egressGateClient) CheckL7(dst tcpip.FullAddress, prefix []byte) (bool, tcpip.Error) {
+	if len(prefix) > egressGateL7SniffLimit {
+		return false, &tcpip.ErrConnectionRefused{}
+	}
+	verdict, err := c.check(egressGateKindL7, dst, prefix)
+	if err != nil {
+		return false, err
+	}
+	switch verdict {
+	case egressGateVerdictAllow:
+		return false, nil
+	case egressGateVerdictNeedMore:
+		return true, nil
+	default:
+		return false, &tcpip.ErrConnectionRefused{}
+	}
+}
+
+func (c *egressGateClient) check(kind byte, dst tcpip.FullAddress, prefix []byte) (byte, tcpip.Error) {
+	// Intra-sandbox loopback (and the unspecified address) never leave the
+	// netstack, so they are not egress and must not be gated — the guest's own
+	// 127.0.0.1/::1 services must keep working. Routed link-local/metadata
+	// destinations are NOT loopback and stay gated by the host operator floor.
+	if egressGateIsLoopbackOrUnspecified(dst.Addr) {
+		return egressGateVerdictAllow, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.dead {
+		return 0, &tcpip.ErrConnectionRefused{}
+	}
+	// body: version(1) kind(1) ip(16, v4 as v4-in-v6) port(2)
+	body := make([]byte, 20+len(prefix))
+	body[0] = egressGateProtocolVersion
+	body[1] = kind
+	ip16 := egressGateAddr16(dst.Addr)
+	copy(body[2:18], ip16[:])
+	binary.BigEndian.PutUint16(body[18:20], dst.Port)
+	copy(body[20:], prefix)
+	frame := make([]byte, 4+len(body))
+	binary.BigEndian.PutUint32(frame[0:4], uint32(len(body)))
+	copy(frame[4:], body)
+
+	_ = c.conn.SetDeadline(time.Now().Add(egressGateCallTimeout))
+	if _, err := c.conn.Write(frame[:]); err != nil {
+		c.failLocked()
+		return 0, &tcpip.ErrConnectionRefused{}
+	}
+	var v [1]byte
+	if _, err := io.ReadFull(c.conn, v[:]); err != nil {
+		c.failLocked()
+		return 0, &tcpip.ErrConnectionRefused{}
+	}
+	return v[0], nil
+}
+
+// failLocked marks the connection dead so every subsequent flow is denied — a
+// stale/late reply can never be misattributed to a later flow. Caller holds mu.
+func (c *egressGateClient) failLocked() {
+	c.dead = true
+	_ = c.conn.Close()
+}
+
+// egressGateIsLoopbackOrUnspecified reports whether a is a loopback (127/8,
+// ::1) or the unspecified address — traffic that never egresses.
+func egressGateIsLoopbackOrUnspecified(a tcpip.Address) bool {
+	switch a.Len() {
+	case 4:
+		b := a.As4()
+		return b[0] == 127 || (b[0]|b[1]|b[2]|b[3]) == 0
+	case 16:
+		b := a.As16()
+		var acc byte
+		for _, x := range b {
+			acc |= x
+		}
+		if acc == 0 {
+			return true
+		}
+		for i := 0; i < 15; i++ {
+			if b[i] != 0 {
+				return false
+			}
+		}
+		return b[15] == 1
+	default:
+		// Unknown address length: not a recognizable loopback, so do NOT
+		// exempt — fall through to the host gate (fail closed). Unreachable
+		// in practice (dst is always 4 or 16 bytes) but keeps the security
+		// contract consistent.
+		return false
+	}
+}
+
+// egressGateAddr16 renders a tcpip.Address as the 16-byte form the host gate
+// decodes (netip.AddrFrom16().Unmap()), encoding IPv4 as v4-in-v6.
+func egressGateAddr16(a tcpip.Address) [16]byte {
+	if a.Len() == 4 {
+		v4 := a.As4()
+		return [16]byte{10: 0xff, 11: 0xff, 12: v4[0], 13: v4[1], 14: v4[2], 15: v4[3]}
+	}
+	return a.As16()
 }

@@ -15,13 +15,17 @@
 package hostmm
 
 import (
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
 )
 
 // HostMemBarrier provides access to the host membarrier(2) operations that the
 // calling process has been verified to support. It is obtained from Probe.
+//
+// On hosts without membarrier(2) (non-Linux), Probe reports no support and
+// the barrier methods are never legal to call (their preconditions are
+// HaveGlobalMemoryBarrier/HaveProcessMemoryBarrier == true); the underlying
+// syscall helper returns ENOSYS there.
 type HostMemBarrier struct {
 	// global is whether the host supports MEMBARRIER_CMD_GLOBAL.
 	global bool
@@ -52,7 +56,7 @@ func (h HostMemBarrier) GlobalMemoryBarrier() error {
 	if !h.global {
 		panic("hostmm: GlobalMemoryBarrier called, but host does not support it")
 	}
-	if _, _, e := unix.Syscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_GLOBAL, 0 /* flags */, 0 /* unused */); e != 0 {
+	if e := membarrierSyscall(linux.MEMBARRIER_CMD_GLOBAL); e != 0 {
 		return e
 	}
 	return nil
@@ -67,7 +71,7 @@ func (h HostMemBarrier) ProcessMemoryBarrier() error {
 	if !h.privateExpedited {
 		panic("hostmm: ProcessMemoryBarrier called unexpectedly")
 	}
-	if _, _, e := unix.RawSyscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0 /* flags */, 0 /* unused */); e != 0 {
+	if _, e := membarrierRawSyscall(linux.MEMBARRIER_CMD_PRIVATE_EXPEDITED); e != 0 {
 		return e
 	}
 	return nil
@@ -92,9 +96,9 @@ func Probe(probePrivateExpedited bool) <-chan HostMemBarrier {
 
 func probe(probePrivateExpedited bool) HostMemBarrier {
 	var mb HostMemBarrier
-	supported, _, e := unix.RawSyscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_QUERY, 0 /* flags */, 0 /* unused */)
+	supported, e := membarrierRawSyscall(linux.MEMBARRIER_CMD_QUERY)
 	if e != 0 {
-		if e != unix.ENOSYS {
+		if e != unixENOSYS {
 			log.Warningf("membarrier(MEMBARRIER_CMD_QUERY) failed: %s", e.Error())
 		}
 		return mb
@@ -108,7 +112,7 @@ func probe(probePrivateExpedited bool) HostMemBarrier {
 	// Registering a  process for private-expedited membarrier blocks on an RCU
 	// grace period (tens of ms), so only do it if needed.
 	if req := uintptr(linux.MEMBARRIER_CMD_PRIVATE_EXPEDITED | linux.MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED); supported&req == req {
-		if _, _, e := unix.RawSyscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0 /* flags */, 0 /* unused */); e != 0 {
+		if _, e := membarrierRawSyscall(linux.MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED); e != 0 {
 			log.Warningf("membarrier(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) failed: %s", e.Error())
 		} else {
 			mb.privateExpedited = true

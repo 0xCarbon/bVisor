@@ -16,6 +16,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -68,7 +69,6 @@ import (
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/starttime"
-	"gvisor.dev/gvisor/runsc/version"
 
 	metricpb "gvisor.dev/gvisor/pkg/metric/metric_go_proto"
 )
@@ -274,6 +274,10 @@ type Args struct {
 	// same order as mounts appear in the spec.
 	IOFiles []*os.File
 
+	// EgressFile is the AF_UNIX FD to the Oca egress flow gate, donated to
+	// the sandbox as --egress-fd (Oca #447). Nil when disabled.
+	EgressFile *os.File
+
 	// File that connects to a gofer endpoint for a device mount point at /dev.
 	DevIOFile *os.File
 
@@ -322,6 +326,10 @@ type Args struct {
 	// open filesystem checkpoint files using O_DIRECT.
 	FSRestoreImagePath string
 	FSRestoreDirect    bool
+
+	// PinRingFile, if non-nil, is the pin ring to donate to the boot
+	// process (see `//pkg/pinring`).
+	PinRingFile *os.File
 }
 
 // New creates the sandbox process. The caller must call Destroy() on the
@@ -537,7 +545,7 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 }
 
 // Restore sends the restore call for a container in the sandbox.
-func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, direct, background, splitFSRestore bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
+func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, imagePath string, direct, background bool, networkArgs *boot.CreateLinksAndRoutesArgs) error {
 	if err := hostsettings.Handle(conf); err != nil {
 		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
 	}
@@ -545,8 +553,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
 
 	opt := boot.RestoreOpts{
-		Background:     background,
-		SplitFSRestore: splitFSRestore,
+		Background: background,
 	}
 	defer func() {
 		for _, f := range opt.FilePayload.Files {
@@ -958,8 +965,10 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if p, err := sentryBin.Path(); err == nil {
 		log.Infof("Sidecar %q found: booting sandbox with %s", sentryBin.Name, p)
 		bootBinPath = p
+	} else if conf.SidecarUsagePolicy.AllowEmbeddedFallback() {
+		sentryBin.WarnUnavailable(fmt.Sprintf("Sidecar %q not usable (%v): booting sandbox with runsc itself", sentryBin.Name, err))
 	} else {
-		log.Warningf("Sidecar %q not usable (%v): booting sandbox with runsc itself", sentryBin.Name, err)
+		return fmt.Errorf("sidecar %q not usable (%v) and --sidecar-usage-policy is set to STRICT", sentryBin.Name, err)
 	}
 
 	// Relay all the config flags to the sandbox process.
@@ -983,8 +992,10 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		log.Infof("Sidecar %q found: prepending Sentry boot command with %s", gvisorbinaries.GvisorSentryPrewarmer.Name, p)
 		cmd.Args = append([]string{p, cmd.Path}, cmd.Args[0:]...)
 		cmd.Path = p
+	} else if conf.SidecarUsagePolicy != config.SidecarUsageStrict {
+		gvisorbinaries.GvisorSentryPrewarmer.WarnUnavailable(fmt.Sprintf("Sidecar %q not found or usable (%v). This slows down gVisor startup significantly", gvisorbinaries.GvisorSentryPrewarmer.Name, err))
 	} else {
-		log.Warningf("Sidecar %q not found or usable (%v). This slows down gVisor startup significantly.", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
+		return fmt.Errorf("sidecar %q not usable (%v) and --sidecar-usage-policy is set to STRICT", gvisorbinaries.GvisorSentryPrewarmer.Name, err)
 	}
 
 	// Transfer FDs that need to be present before the "boot" command.
@@ -1015,10 +1026,14 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	// If there is a gofer, sends all socket ends to the sandbox.
 	donations.DonateAndClose("io-fds", args.IOFiles...)
+	if args.EgressFile != nil {
+		donations.DonateAndClose("egress-fd", args.EgressFile)
+	}
 	donations.DonateAndClose("dev-io-fd", args.DevIOFile)
 	donations.DonateAndClose("gofer-filestore-fds", args.GoferFilestoreFiles...)
 	donations.DonateAndClose("mounts-fd", args.MountsFile)
 	donations.Donate("start-sync-fd", startSyncFile)
+	donations.DonateAndClose("pin-ring-fd", args.PinRingFile)
 	if err := donations.DonateLogFile("user-log-fd", args.UserLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, lfOpts); err != nil {
 		return err
 	}
@@ -1587,6 +1602,9 @@ func (s *Sandbox) destroy() error {
 // true and signal is SIGKILL, then waits for all processes to exit before
 // returning.
 func (s *Sandbox) SignalContainer(cid string, sig unix.Signal, all bool) error {
+	if sig < 0 || sig > linux.SignalMaximum {
+		return fmt.Errorf("invalid signal %d: %w", sig, unix.EINVAL)
+	}
 	log.Debugf("Signal sandbox %q", s.ID)
 	mode := boot.DeliverToProcess
 	if all {
@@ -1609,6 +1627,9 @@ func (s *Sandbox) SignalContainer(cid string, sig unix.Signal, all bool) error {
 // in the same session that PID belongs to. This is only valid if the process
 // is attached to a host TTY.
 func (s *Sandbox) SignalProcess(cid string, pid int32, sig unix.Signal, fgProcess bool) error {
+	if sig < 0 || sig > linux.SignalMaximum {
+		return fmt.Errorf("invalid signal %d: %w", sig, unix.EINVAL)
+	}
 	log.Debugf("Signal sandbox %q", s.ID)
 
 	mode := boot.DeliverToProcess
@@ -1631,6 +1652,9 @@ func (s *Sandbox) SignalProcess(cid string, pid int32, sig unix.Signal, fgProces
 // SignalProcessGroup sends the signal to all processes in the process group
 // identified by pgid. pgid is relative to the root PID namespace.
 func (s *Sandbox) SignalProcessGroup(cid string, pgid int32, sig unix.Signal) error {
+	if sig < 0 || sig > linux.SignalMaximum {
+		return fmt.Errorf("invalid signal %d: %w", sig, unix.EINVAL)
+	}
 	log.Debugf("Signal sandbox %q process group %d", s.ID, pgid)
 
 	args := boot.SignalArgs{
@@ -1653,7 +1677,6 @@ type CheckpointOpts struct {
 	ExcludeCommittedZeroPages bool
 	CudaCheckpointPath        string
 	CudaCheckpointSequential  bool
-	SplitFSCheckpointPaths    []checkpoint.ResourceID
 
 	// Save/restore exec options.
 	SaveRestoreExecArgv        string
@@ -1666,22 +1689,12 @@ type CheckpointOpts struct {
 func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, opts CheckpointOpts) error {
 	log.Debugf("Checkpoint sandbox %q, imagePath %q, opts %+v", s.ID, imagePath, opts)
 
-	if len(opts.SplitFSCheckpointPaths) > 0 {
-		// Verify we are not using GCS/gofer.
-		gcsOptsPath := path.Join(imagePath, checkpointGCSOptsFileName)
-		if _, err := os.Stat(gcsOptsPath); err == nil {
-			return fmt.Errorf("split filesystem checkpoint is not supported with GCS/gofer")
-		}
-	}
-
 	opt := control.SaveOpts{
 		Metadata:                       opts.Compression.ToMetadata(),
 		AppMFExcludeCommittedZeroPages: opts.ExcludeCommittedZeroPages,
 		Resume:                         opts.Resume,
 		CudaCheckpointPath:             opts.CudaCheckpointPath,
 		CudaCheckpointSequential:       opts.CudaCheckpointSequential,
-		SplitFSCheckpointPaths:         opts.SplitFSCheckpointPaths,
-		RunscVersion:                   version.Version(),
 		ExecOpts: control.SaveRestoreExecOpts{
 			Argv:        opts.SaveRestoreExecArgv,
 			Timeout:     opts.SaveRestoreExecTimeout,
@@ -1698,10 +1711,47 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 	}
 
 	if err := s.call(boot.ContMgrCheckpoint, &opt, nil); err != nil {
-		return fmt.Errorf("checkpointing container %q: %w", cid, err)
+		err = fmt.Errorf("checkpointing container %q: %w", cid, classifyCheckpointError(err))
+		if !opt.UseCheckpointGofer {
+			// The checkpoint RPC failed, so the sandbox died before (or
+			// while) finalizing the image: anything it managed to write is
+			// a partial image. The files were O_EXCL-created by this call
+			// (setCheckpointOptsFiles above succeeded), so removing exactly
+			// them can never delete a pre-existing image. Leaving them
+			// behind would let a later `runsc restore` consume a truncated
+			// image and fail with a cryptic state-decode error (e.g.
+			// "header error: EOF") instead of a missing image.
+			if rmErr := removeLocalSaveFiles(imagePath, opts); rmErr != nil {
+				log.Warningf("Checkpoint failed (%v) and cleaning up the incomplete image files at %q failed too: %v", err, imagePath, rmErr)
+			} else {
+				log.Warningf("Checkpoint failed (%v); removed the incomplete image files it created at %q", err, imagePath)
+			}
+		}
+		return err
 	}
 	s.Checkpointed = true
 	return nil
+}
+
+// removeLocalSaveFiles removes the checkpoint image files that
+// createSaveFiles() created in imagePath.
+//
+// Precondition: the corresponding setCheckpointOptsFilesForLocalCheckpoint()
+// call succeeded, which used O_EXCL to create these files; therefore they were
+// created by (and only by) that call, and removing them cannot destroy
+// pre-existing data. opts must be the same CheckpointOpts that were used.
+func removeLocalSaveFiles(imagePath string, opts CheckpointOpts) error {
+	names := []string{checkpointfiles.StateFileName}
+	if opts.Compression == statefile.CompressionLevelNone {
+		names = append(names, checkpointfiles.PagesMetadataFileName, checkpointfiles.PagesFileName)
+	}
+	var errs []error
+	for _, name := range names {
+		if err := os.Remove(filepath.Join(imagePath, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Sandbox) setCheckpointOptsFiles(conf *config.Config, imagePath string, opts CheckpointOpts, opt *control.SaveOpts) error {
@@ -1726,21 +1776,6 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
 	}
 	opt.FilePayload.Files = files
 	opt.HavePagesFile = len(files) > 1
-
-	if len(opts.SplitFSCheckpointPaths) > 0 {
-		fsImagePath := filepath.Join(imagePath, "fs")
-		if err := os.MkdirAll(fsImagePath, 0755); err != nil {
-			return fmt.Errorf("creating fs checkpoint directory: %w", err)
-		}
-		fsFiles, err := openFSCheckpointLocalFiles(fsImagePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, opts.Direct)
-		if err != nil {
-			for _, f := range files {
-				_ = f.Close()
-			}
-			return fmt.Errorf("creating fs checkpoint files: %w", err)
-		}
-		opt.FilePayload.Files = append(opt.FilePayload.Files, fsFiles...)
-	}
 	return nil
 }
 
@@ -1749,12 +1784,28 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
 // RPCs and argument passing to the sandbox.
 func createSaveFiles(path string, direct bool, compression statefile.CompressionLevel) ([]*os.File, error) {
 	var files []*os.File
+	// createdPaths tracks the files this call created so far. On failure, they
+	// are removed: a caller that retries with the same image-path must not
+	// find O_EXCL leftovers from a partially failed attempt, and nothing else
+	// must ever observe a half-created image.
+	var createdPaths []string
+	defer func() {
+		if createdPaths != nil {
+			for _, f := range files {
+				_ = f.Close()
+			}
+			for _, p := range createdPaths {
+				_ = os.Remove(p)
+			}
+		}
+	}()
 
 	stateFilePath := filepath.Join(path, checkpointfiles.StateFileName)
 	f, err := os.OpenFile(stateFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("creating checkpoint state file %q: %w", stateFilePath, err)
 	}
+	createdPaths = append(createdPaths, stateFilePath)
 	files = append(files, f)
 
 	// When there is no compression, MemoryFile contents are page-aligned.
@@ -1766,6 +1817,7 @@ func createSaveFiles(path string, direct bool, compression statefile.Compression
 		if err != nil {
 			return nil, fmt.Errorf("creating checkpoint pages metadata file %q: %w", pagesMetadataFilePath, err)
 		}
+		createdPaths = append(createdPaths, pagesMetadataFilePath)
 		files = append(files, f)
 
 		pagesFilePath := filepath.Join(path, checkpointfiles.PagesFileName)
@@ -1778,9 +1830,13 @@ func createSaveFiles(path string, direct bool, compression statefile.Compression
 		if err != nil {
 			return nil, fmt.Errorf("creating checkpoint pages file %q: %w", pagesFilePath, err)
 		}
+		createdPaths = append(createdPaths, pagesFilePath)
 		files = append(files, f)
 	}
 
+	// Success: transfer ownership of the created files to the caller; the
+	// deferred cleanup must not remove them on return.
+	createdPaths = nil
 	return files, nil
 }
 
@@ -1864,10 +1920,22 @@ func setFSSaveArgsForLocalCheckpointFiles(conf *config.Config, imagePath string,
 
 func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([]*os.File, error) {
 	var files [4]*os.File
+	var createdPaths []string
+	// Only files this call CREATED may be removed on failure: the restore
+	// path calls this with O_RDONLY on pre-existing image files, which must
+	// never be deleted (a restore failure must not destroy the checkpoint).
+	mayRemove := openFlags&os.O_CREATE != 0
 	closeCleanup := cleanup.Make(func() {
 		for _, f := range files {
 			if f != nil {
 				f.Close()
+			}
+		}
+		// Remove partial creations so a retried checkpoint does not hit
+		// O_EXCL leftovers and no half-created image is ever observable.
+		if mayRemove {
+			for _, p := range createdPaths {
+				_ = os.Remove(p)
 			}
 		}
 	})
@@ -1904,6 +1972,7 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 		return nil, fmt.Errorf("opening manifest file %q: %w", manifestFilePath, err)
 	}
 	files[0] = manifestFile
+	createdPaths = append(createdPaths, manifestFilePath)
 
 	multiTarFilePath := filepath.Join(imagePath, checkpointfiles.FSCheckpointMultiTarFileName)
 	multiTarFile, err := os.OpenFile(multiTarFilePath, openFlags, 0644)
@@ -1911,6 +1980,7 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 		return nil, fmt.Errorf("opening multi-tar file %q: %w", multiTarFilePath, err)
 	}
 	files[1] = multiTarFile
+	createdPaths = append(createdPaths, multiTarFilePath)
 
 	pagesMetadataFilePath := filepath.Join(imagePath, checkpointfiles.PagesMetadataFileName)
 	pagesMetadataFile, err := os.OpenFile(pagesMetadataFilePath, openFlags, 0644)
@@ -1918,6 +1988,7 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 		return nil, fmt.Errorf("opening pages metadata file %q: %w", pagesMetadataFilePath, err)
 	}
 	files[2] = pagesMetadataFile
+	createdPaths = append(createdPaths, pagesMetadataFilePath)
 
 	pagesFilePath := filepath.Join(imagePath, checkpointfiles.PagesFileName)
 	pagesFileFD, err := unix.Open(pagesFilePath, openFlags|maybeODirect, 0644)
@@ -1925,6 +1996,7 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 		return nil, fmt.Errorf("opening pages metadata file %q: %w", pagesFilePath, err)
 	}
 	files[3] = os.NewFile(uintptr(pagesFileFD), pagesFilePath)
+	createdPaths = append(createdPaths, pagesFilePath)
 
 	closeCleanup.Release()
 	return files[:], nil
@@ -2171,8 +2243,43 @@ func (s *Sandbox) IsRunning() bool {
 		return false
 	}
 	// Send a signal 0 to the sandbox process. If it succeeds, the sandbox
-	// process is running.
-	return unix.Kill(pid, 0) == nil
+	// process exists.
+	if unix.Kill(pid, 0) != nil {
+		return false
+	}
+	// Signal 0 also succeeds on zombie processes. If the sandbox exited but
+	// nobody reaped it (e.g. it was started detached and its parent is gone),
+	// it remains a zombie forever, so it must not be reported as running.
+	return !procIsZombie(pid)
+}
+
+// procIsZombie returns true if the process with the given PID is a zombie or
+// has already been reaped (in which case it is equally not running). It
+// returns false if the process state cannot be determined.
+func procIsZombie(pid int) bool {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// The process exited and was reaped between the signal 0 above
+			// and this read; it is definitively not running (nor a zombie).
+			return true
+		}
+		// The process exists but its state cannot be determined; assume
+		// that it is not a zombie.
+		return false
+	}
+	return statIsZombie(b)
+}
+
+// statIsZombie returns whether a /proc/[pid]/stat buffer describes a zombie.
+// The process state is the field following the second field (comm), which is
+// enclosed in parentheses and may itself contain parentheses and spaces, so
+// search for the last ')'.
+func statIsZombie(b []byte) bool {
+	if i := bytes.LastIndexByte(b, ')'); i >= 0 && i+2 < len(b) {
+		return b[i+2] == 'Z'
+	}
+	return false
 }
 
 // Stacks collects and returns all stacks for the sandbox.

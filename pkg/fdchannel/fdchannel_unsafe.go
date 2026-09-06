@@ -33,7 +33,7 @@ const sizeofInt32 = int(unsafe.Sizeof(int32(0)))
 // representing connected sockets that may be passed to separate calls to
 // NewEndpoint to create connected Endpoints.
 func NewConnectedSockets() ([2]int, error) {
-	return unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+	return socketpairSeqPacket()
 }
 
 // Endpoint sends file descriptors to, and receives them from, another
@@ -68,6 +68,33 @@ func NewEndpoint(sockfd int) *Endpoint {
 	ep.Init(sockfd)
 	return ep
 }
+
+// FDDonator is the fd-donation seam: the ability to pass file descriptors
+// between mutually-distrusting processes, one FD per message, in order. The
+// Linux implementation is an AF_UNIX SOCK_SEQPACKET socketpair with one
+// SCM_RIGHTS control message per FD (Endpoint). Non-Linux hosts provide the
+// interface through a wave-05 backend; see pkg/flipcall/SEAM.md. Consumers
+// (e.g. pkg/lisafs channels) must treat FDs as supplementary data: a failed
+// SendFD loses that FD and all subsequent ones, never the whole RPC.
+type FDDonator interface {
+	// SendFD sends fd (does not take ownership).
+	SendFD(fd int) error
+
+	// RecvFD blocks until the peer sends an FD.
+	RecvFD() (int, error)
+
+	// RecvFDNonblock returns the next FD if one is immediately available.
+	RecvFDNonblock() (int, error)
+
+	// Shutdown causes concurrent and future calls on both endpoints to
+	// fail, without destroying the endpoints.
+	Shutdown()
+
+	// Destroy releases resources owned by the endpoint.
+	Destroy()
+}
+
+var _ FDDonator = (*Endpoint)(nil)
 
 // Destroy releases resources owned by ep. No other Endpoint methods may be
 // called after Destroy.

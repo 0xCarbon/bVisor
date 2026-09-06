@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build linux
+// +build linux
+
 // Package eventfd wraps Linux's eventfd(2) syscall.
 package eventfd
 

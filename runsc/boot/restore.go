@@ -37,12 +37,14 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
@@ -340,10 +342,9 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
 }
 
 type restoreMounts struct {
-	fdmap             map[checkpoint.ResourceID]int
-	mfmap             map[checkpoint.ResourceID]*pgalloc.MemoryFile
-	sharedMfs         map[string]bool
-	fsCheckpointedMfs map[checkpoint.ResourceID]struct{}
+	fdmap     map[checkpoint.ResourceID]int
+	mfmap     map[checkpoint.ResourceID]*pgalloc.MemoryFile
+	sharedMfs map[string]bool
 }
 
 func (r *restoreMounts) String() string {
@@ -372,7 +373,7 @@ func (r *restorer) restore(l *Loader) error {
 	}
 	r.timer.Reached("specs validated")
 
-	p, err := createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile, l.sandboxID, r.timer)
+	p, err := createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile, l.sandboxID, r.timer, &l.pinRing)
 	if err != nil {
 		return fmt.Errorf("creating platform: %v", err)
 	}
@@ -435,11 +436,40 @@ func (r *restorer) restore(l *Loader) error {
 	defer cu.Clean()
 
 	restoreMnts := restoreMounts{
-		fdmap:             make(map[checkpoint.ResourceID]int),
-		mfmap:             make(map[checkpoint.ResourceID]*pgalloc.MemoryFile),
-		sharedMfs:         make(map[string]bool),
-		fsCheckpointedMfs: make(map[checkpoint.ResourceID]struct{}),
+		fdmap:     make(map[checkpoint.ResourceID]int),
+		mfmap:     make(map[checkpoint.ResourceID]*pgalloc.MemoryFile),
+		sharedMfs: make(map[string]bool),
 	}
+	// Restored stdio / pass-FD re-donation contract (wave-04).
+	//
+	// Host resources that back guest file descriptors (host.inode, e.g. the
+	// donated stdio streams and --pass-fd files) cannot be serialized: at save
+	// time they are written into the image as placeholder host filesystem
+	// resources keyed by checkpoint.ResourceID{ContainerName, "host:<fd>"}
+	// (see fsimpl/host.MakeResourceID). At restore time the caller donates NEW
+	// host file descriptors, and the saved placeholders are re-bound to them
+	// through the fdmap built below.
+	//
+	// The key is (container name, guest descriptor number):
+	//   - The container name is the OCI annotation
+	//     io.kubernetes.cri.container-name of the RESTORED container's spec
+	//     (specutils.ContainerName), NOT the runtime container ID. A restore
+	//     therefore re-donates correctly only when the spec carries the same
+	//     container-name annotation as the checkpointed container (containers
+	//     without the annotation fall back to positional names "__no_name_N",
+	//     which match only when containers are restored in the same order they
+	//     were created).
+	//   - For stdio, the descriptor number is the position of the donated FD
+	//     in the --stdio-fds list (stdin=0, stdout=1, stderr=2): the FDs are
+	//     donated positionally at sandbox boot and keyed by index.
+	//   - For pass-FDs (--pass-fd M:N, or library Args.PassFiles[N]), the
+	//     descriptor number is the GUEST fd N of the original mapping; the
+	//     restored mapping may use a different host FD M.
+	//
+	// Embedders (e.g. oca's RestoreWithInitControl) rely on this to replace a
+	// saved init's stdio with a fresh full-duplex AF_UNIX endpoint: donate the
+	// new endpoint as guest fd 0 under the same container name, and the
+	// restored kernel re-binds it during LoadFrom.
 	for _, cont := range r.containers {
 		// TODO(b/298078576): Need to process hints here probably
 		mntr := l.newContainerMounter(cont)
@@ -460,18 +490,15 @@ func (r *restorer) restore(l *Loader) error {
 	log.Debugf("Restore using mounts: %v", &restoreMnts)
 	ctx := l.k.SupervisorContext()
 	ctx = context.WithValues(ctx, map[any]any{
-		vfs.CtxRestoreFilesystemFDMap:        restoreMnts.fdmap,
-		pgalloc.CtxMemoryFileMap:             restoreMnts.mfmap,
-		pgalloc.CtxFSCheckpointedMemoryFiles: restoreMnts.fsCheckpointedMfs,
-		devutil.CtxDevGoferClientProvider:    l.k,
-		kernel.CtxFSRestore:                  l.fsRestore != nil,
-		vfs.CtxFSTarProvider:                 l.fsRestore,
+		vfs.CtxRestoreFilesystemFDMap:     restoreMnts.fdmap,
+		pgalloc.CtxMemoryFileMap:          restoreMnts.mfmap,
+		devutil.CtxDevGoferClientProvider: l.k,
 	})
 
 	if r.asyncMFLoader != nil {
 		// Now that private memory files are known, kick off their loading in the
 		// background goroutine.
-		r.asyncMFLoader.KickoffPrivate(ctx, restoreMnts.mfmap)
+		r.asyncMFLoader.KickoffPrivate(restoreMnts.mfmap)
 	}
 
 	ctx, err = r.prepareNvproxyRestoreContextLocked(ctx, l)
@@ -484,16 +511,32 @@ func (r *restorer) restore(l *Loader) error {
 	}
 
 	// Load the state.
+	clocks := time.NewCalibratedClocks(shouldEnableClockMonotonicRaw(l.root.spec, l.root.conf))
 	r.timer.Reached("loading kernel")
 	if r.extractRootFsMode {
-		if err := l.k.ExtractRootfsUpperLayer(ctx, r.stateFile, r.asyncMFLoader, nil, time.NewCalibratedClocks(), r.rootFsOutputTar); err != nil {
+		if err := l.k.ExtractRootfsUpperLayer(ctx, r.stateFile, r.asyncMFLoader, nil, clocks, r.rootFsOutputTar); err != nil {
 			return fmt.Errorf("failed to extract rootfs upper layer: %w", err)
 		}
 		r.timer.Reached("rootfs upper layer extracted")
 		return nil
 	}
-	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader, nil, l, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}, r.timer.Fork("kernel load")); err != nil {
+	// Re-inject the live egress gate into the restored kernel: the saved
+	// Stack's gate is state:"nosave" (its socket cannot cross a checkpoint),
+	// so without this the restored stack would silently run ungated even
+	// though restore donated --egress-fd.
+	if l.egressGate != nil {
+		ctx = context.WithValue(ctx, stack.CtxEgressGate{}, stack.EgressGate(l.egressGate))
+	}
+	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader, nil, l, clocks, &vfs.CompleteRestoreOptions{}, r.timer.Fork("kernel load")); err != nil {
 		return fmt.Errorf("failed to load kernel: %w", err)
+	}
+	// Fail closed: a checkpoint taken with an egress gate must not come
+	// back up ungated (Stack.egressGated survives the state file; the gate
+	// itself does not).
+	if ns := l.k.RootNetworkNamespace(); ns != nil && l.egressGate == nil {
+		if st, ok := ns.Stack().(*netstack.Stack); ok && st.Stack.EgressGated() {
+			return fmt.Errorf("checkpoint was created with an egress gate; restore must donate --egress-fd")
+		}
 	}
 	r.timer.Reached("kernel loaded")
 	if oldNvidiaDriverVersion.Major() > 0 && !l.k.NvidiaDriverVersion.Equals(oldNvidiaDriverVersion) {
@@ -689,10 +732,6 @@ func (l *Loader) save(o *control.SaveOpts) (err error) {
 		return err
 	}
 	defer saveOpts.Close()
-
-	if saveOpts.FSSaveOpts != nil {
-		saveOpts.FSSaveOpts.RunscVersion = version.Version()
-	}
 
 	return l.saveWithOpts(saveOpts, &o.ExecOpts)
 }

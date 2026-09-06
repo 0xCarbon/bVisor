@@ -37,6 +37,9 @@ func logDisconnect() {
 }
 
 // beforeSave is invoked by stateify.
+//
+// +checklocksexclude:e.segmentQueue.mu
+// +checklocksexclude:e.pendingProcessingMu
 func (e *Endpoint) beforeSave() {
 	// Stop incoming packets.
 	e.segmentQueue.freeze()
@@ -137,6 +140,20 @@ func (e *Endpoint) afterLoad(ctx context.Context) {
 	// Restore the endpoint to InitialState as it will be moved to
 	// its origEndpointState during Restore.
 	e.state = atomicbitops.FromUint32(uint32(StateInitial))
+	// A stream whose initial bytes were still held for classification cannot
+	// safely resume: the gate session does not survive a checkpoint, so the
+	// held prefix can never be classified. Restore it as a terminated
+	// connection unconditionally — including under AllowLiveTCPMigration
+	// (which defaults to true and would otherwise skip terminateAtRestore
+	// and resume the flow with unclassified bytes still queued).
+	if e.egressL7Hold {
+		e.terminateAtRestore = true
+		e.egressL7Terminate = true
+		e.egressL7Required = false
+		e.egressL7Hold = false
+		e.egressL7Prefix = nil
+		e.egressL7Rounds = 0
+	}
 	e.stack.RegisterRestoredEndpoint(e)
 }
 
@@ -146,15 +163,12 @@ func (e *Endpoint) closeEndpointAtRestore() {
 	defer e.mu.Unlock()
 
 	epState := EndpointState(e.origEndpointState)
-	if !epState.connected() && !epState.handshake() {
+	if !epState.connected() && !epState.connecting() {
 		log.Debugf("endpoint was marked to terminate at restore in a wrong state, ID: %+v state: %v", e.ID, epState)
 		return
 	}
 
-	if epState.handshake() {
-		connectedLoading.Wait()
-		listenLoading.Wait()
-	}
+	log.Debugf("terminating TCP connection during restore, ID: %+v state: %v", e.ID, epState)
 
 	// Put the endpoint in the error state and do cleanup. Do not
 	// attempt to send RST as route will be nil.
@@ -170,12 +184,15 @@ func (e *Endpoint) closeEndpointAtRestore() {
 
 	if epState.connected() {
 		connectedLoading.Done()
-	} else {
+	} else if epState.connecting() {
 		connectingLoading.Done()
 	}
 }
 
 // Restore implements tcpip.RestoredEndpoint.Restore.
+//
+// +checklocksexclude:e.segmentQueue.mu
+// +checklocksexclude:e.pendingProcessingMu
 func (e *Endpoint) Restore(s *stack.Stack) {
 	if !e.EndpointState().closed() {
 		e.keepalive.timer.init(s.Clock(), timerHandler(e, e.keepaliveTimerExpired))
@@ -203,7 +220,7 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 		e.setEndpointState(StateBound)
 	}
 
-	if terminateAtRestore && !e.stack.AllowLiveTCPMigration() {
+	if terminateAtRestore && !e.stack.AllowLiveTCPMigration() || e.egressL7Terminate {
 		e.closeEndpointAtRestore()
 		return
 	}
@@ -363,12 +380,17 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 }
 
 // Resume implements tcpip.ResumableEndpoint.Resume.
+//
+// +checklocksexclude:e.segmentQueue.mu
 func (e *Endpoint) Resume() {
 	e.segmentQueue.thaw()
 }
 
 // requeueOnRestore re-adds the endpoint to its processor's run-queue if it has
 // queued segments. The run-queue is not saved across checkpoint/restore.
+//
+// +checklocksexclude:e.segmentQueue.mu
+// +checklocksexclude:e.pendingProcessingMu
 func (e *Endpoint) requeueOnRestore() {
 	if e.segmentQueue.empty() || e.isOwnedByUser() {
 		return

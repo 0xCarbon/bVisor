@@ -99,8 +99,16 @@ type Boot struct {
 	// deviceFD is the file descriptor for the platform device file.
 	deviceFD int
 
+	// pinRingFD is the file descriptor of the donated pin ring.
+	// See `//pkg/pinring`.
+	pinRingFD int
+
 	// ioFDs is the list of FDs used to connect to FS gofers.
 	ioFDs sandboxsetup.IntFlags
+
+	// egressFD is the AF_UNIX FD to the Oca egress flow gate, or -1 when the
+	// egress data path is disabled (Oca #447).
+	egressFD int
 
 	// devIoFD is the FD to connect to dev gofer.
 	devIoFD int
@@ -229,6 +237,15 @@ type Boot struct {
 	rootfsUpperTarFD int
 }
 
+// optionalFD preserves descriptor 0 as a valid explicit donation while making
+// the zero value of boot.Args unambiguously mean "not configured".
+func optionalFD(fd int) *int {
+	if fd < 0 {
+		return nil
+	}
+	return &fd
+}
+
 // Name implements subcommands.Command.Name.
 func (*Boot) Name() string {
 	return "boot"
@@ -273,7 +290,9 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&b.specFD, "spec-fd", -1, "required fd with the container spec")
 	f.IntVar(&b.controllerFD, "controller-fd", -1, "required FD of a stream socket for the control server that must be donated to this process")
 	f.IntVar(&b.deviceFD, "device-fd", -1, "FD for the platform device file")
+	f.IntVar(&b.pinRingFD, "pin-ring-fd", -1, "FD of a disabled io_uring in which the sentry pins its expensive-to-release files")
 	f.Var(&b.ioFDs, "io-fds", "list of image FDs and/or socket FDs to connect gofer clients. They must follow this order: root first, then mounts as defined in the spec")
+	f.IntVar(&b.egressFD, "egress-fd", -1, "AF_UNIX FD to the Oca egress flow gate (Oca #447); -1 disables egress enforcement")
 	f.IntVar(&b.devIoFD, "dev-io-fd", -1, "FD to connect dev gofer client")
 	f.Var(&b.stdioFDs, "stdio-fds", "list of FDs containing sandbox stdin, stdout, and stderr in that order")
 	f.Var(&b.passFDs, "pass-fd", "mapping of host to guest FDs. They must be in M:N format. M is the host and N the guest descriptor.")
@@ -663,11 +682,13 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		Conf:                conf,
 		ControllerFD:        b.controllerFD,
 		Device:              fd.New(b.deviceFD),
+		PinRingFD:           b.pinRingFD,
 		GoferFDs:            b.ioFDs.GetArray(),
 		DevGoferFD:          b.devIoFD,
 		StdioFDs:            b.stdioFDs.GetArray(),
 		PassFDs:             b.passFDs.GetArray(),
 		ExecFD:              b.execFD,
+		EgressFD:            optionalFD(b.egressFD),
 		GoferFilestoreFDs:   b.goferFilestoreFDs.GetArray(),
 		GoferMountConfs:     b.goferMountConfs.GetArray(),
 		NumCPU:              b.cpuNum,
