@@ -278,6 +278,10 @@ type Args struct {
 	// the sandbox as --egress-fd (Oca #447). Nil when disabled.
 	EgressFile *os.File
 
+	// IngressFile is the AF_UNIX FD to the Oca host-ingress relay, donated
+	// to the sandbox as --ingress-fd (Oca #541). Nil when disabled.
+	IngressFile *os.File
+
 	// File that connects to a gofer endpoint for a device mount point at /dev.
 	DevIOFile *os.File
 
@@ -1028,6 +1032,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	donations.DonateAndClose("io-fds", args.IOFiles...)
 	if args.EgressFile != nil {
 		donations.DonateAndClose("egress-fd", args.EgressFile)
+	}
+	if args.IngressFile != nil {
+		donations.DonateAndClose("ingress-fd", args.IngressFile)
 	}
 	donations.DonateAndClose("dev-io-fd", args.DevIOFile)
 	donations.DonateAndClose("gofer-filestore-fds", args.GoferFilestoreFiles...)

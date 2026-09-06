@@ -233,6 +233,11 @@ type Args struct {
 	// pointer disables the data path; an explicit descriptor 0 remains valid.
 	// Re-donated to the sandbox (Oca #447).
 	EgressFD *int
+
+	// IngressFD is the optional AF_UNIX FD to the Oca host-ingress relay. A
+	// nil pointer disables the data path; an explicit descriptor 0 remains
+	// valid. Re-donated to the sandbox (Oca #541).
+	IngressFD *int
 }
 
 // New creates the container in a new Sandbox process, unless the metadata
@@ -414,6 +419,10 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		if args.EgressFD != nil {
 			egressFile = os.NewFile(uintptr(*args.EgressFD), "oca-egress-fd")
 		}
+		var ingressFile *os.File
+		if args.IngressFD != nil {
+			ingressFile = os.NewFile(uintptr(*args.IngressFD), "oca-ingress-fd")
+		}
 		sandArgs := &sandbox.Args{
 			ID:                  sandboxID,
 			Spec:                args.Spec,
@@ -422,6 +431,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			UserLog:             args.UserLog,
 			IOFiles:             ioFiles,
 			EgressFile:          egressFile,
+			IngressFile:         ingressFile,
 			DevIOFile:           devIOFile,
 			MountsFile:          specFile,
 			Cgroup:              containerCgroup,

@@ -175,6 +175,11 @@ type CreateOptions struct {
 	// Consumed on success.
 	EgressFile *os.File
 
+	// IngressFile is the AF_UNIX connection to the host-ingress relay that
+	// is re-donated into the sandbox netstack (Oca #541 --ingress-fd).
+	// Consumed on success.
+	IngressFile *os.File
+
 	// PassFiles are host files bound to guest descriptor numbers; they are
 	// re-donated (not serialized) across checkpoint/restore. Consumed on
 	// success.
@@ -218,6 +223,10 @@ func (r *Runtime) Create(opts CreateOptions) (*Container, error) {
 		closeFDs(ioFDs)
 		return nil, fmt.Errorf("library: acquiring egress file: %w", err)
 	}
+	if args.IngressFD, err = fileFD(opts.IngressFile); err != nil {
+		closeFDs(filterNil(args.IngressFD, args.EgressFD, ioFDs))
+		return nil, fmt.Errorf("library: acquiring ingress file: %w", err)
+	}
 	if r.exePath != "" {
 		prev := specutils.ExePath
 		specutils.ExePath = r.exePath
@@ -225,7 +234,7 @@ func (r *Runtime) Create(opts CreateOptions) (*Container, error) {
 	}
 	c, err := container.New(r.conf, args)
 	if err != nil {
-		closeFDs(filterNil(args.EgressFD, ioFDs))
+		closeFDs(filterNil(args.IngressFD, args.EgressFD, ioFDs))
 		return nil, fmt.Errorf("library: creating container %q: %w", opts.ID, err)
 	}
 	return &Container{rt: r, cont: c}, nil
@@ -292,6 +301,7 @@ type RestoreOptions struct {
 	// unused.
 	GoferIOFiles []*os.File
 	EgressFile   *os.File
+	IngressFile  *os.File
 	PassFiles    map[int]*os.File
 	ExecFile     *os.File
 
@@ -382,6 +392,10 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 		closeFDs(ioFDs)
 		return nil, fmt.Errorf("library: acquiring egress file: %w", err)
 	}
+	if args.IngressFD, err = fileFD(opts.IngressFile); err != nil {
+		closeFDs(filterNil(args.IngressFD, args.EgressFD, ioFDs))
+		return nil, fmt.Errorf("library: acquiring ingress file: %w", err)
+	}
 	if r.exePath != "" {
 		prev := specutils.ExePath
 		specutils.ExePath = r.exePath
@@ -389,7 +403,7 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 	}
 	c, err = container.New(r.conf, args)
 	if err != nil {
-		closeFDs(filterNil(args.EgressFD, ioFDs))
+		closeFDs(filterNil(args.IngressFD, args.EgressFD, ioFDs))
 		return nil, fmt.Errorf("library: creating container %q for restore: %w", opts.ID, err)
 	}
 	lc := &Container{rt: r, cont: c}
@@ -458,9 +472,13 @@ func closeFDs(fds []int) {
 	}
 }
 
-// filterNil returns the FD list with a nil pointer flattened.
-func filterNil(egress *int, ioFDs []int) []int {
-	all := make([]int, 0, len(ioFDs)+1)
+// filterNil returns the FD list with the nilable donation pointers
+// flattened ahead of the gofer IO FDs.
+func filterNil(ingress, egress *int, ioFDs []int) []int {
+	all := make([]int, 0, len(ioFDs)+2)
+	if ingress != nil {
+		all = append(all, *ingress)
+	}
 	if egress != nil {
 		all = append(all, *egress)
 	}
