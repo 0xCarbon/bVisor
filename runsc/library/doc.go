@@ -74,6 +74,8 @@
 //	  runsc spawns no gofer of its own.
 //	EgressFile:  AF_UNIX connection to the egress flow gate re-donated
 //	  into the sandbox's netstack.
+//	IngressFile: AF_UNIX connection to the host-ingress relay re-donated
+//	  into the sandbox's netstack (Oca #541).
 //	PassFiles:   host files bound to guest descriptor numbers (stdio and
 //	  friends); across checkpoint/restore these are re-donated: a restored
 //	  container re-binds saved guest descriptors to whatever the restore
@@ -83,7 +85,7 @@
 // OWNERSHIP: donated files are consumed. The library dups each descriptor
 // and closes the caller's *os.File (disarming its finalizer) at Create or
 // Restore time; the runtime then donates the dup and closes it
-// (donation.DonateAndClose for gofer/egress connections) or transfers it
+// (donation.DonateAndClose for gofer/egress/ingress connections) or transfers it
 // (DonateAndTransferCustomFiles for PassFiles) once creation succeeds.
 // Callers must not use or close the files after passing them (the library
 // already did). On failure before the sandbox spawn, the dup is closed by

@@ -143,6 +143,7 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	defer cu.Clean()
 
 	runArgs := container.Args{
+
 		ID:            id,
 		Spec:          nil,
 		BundleDir:     bundleDir,
@@ -152,6 +153,7 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 		Attached:      !r.detach,
 		IOFDs:         r.ioFDs,
 		EgressFD:      optionalFD(r.egressFD),
+		IngressFD:     optionalFD(r.ingressFD),
 	}
 
 	log.Debugf("Restore container, cid: %s, rootDir: %q", id, conf.RootDir)
