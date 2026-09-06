@@ -23,9 +23,9 @@ import (
 )
 
 // unsupportedIPC fails every operation with ErrUnsupported. Non-Linux
-// backends (wave-05+; macOS Virtualization.framework, Windows WHP2) replace
-// Default() with a real implementation; until then the sentry compiles with
-// the seam present and mounts that need local IPC fail closed. See
+// backends must provide a real implementation and wire its callers. These
+// stubs support compilation of the interface package on supported non-Linux
+// build targets; they do not provide a runnable non-Linux sentry. See
 // pkg/sentry/platform/platform-seam.md.
 type unsupportedIPC struct{}
 

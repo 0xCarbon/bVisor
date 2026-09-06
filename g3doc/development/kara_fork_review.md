@@ -93,3 +93,17 @@ cross-machine performance guarantees.
 
 All three affected test targets pass together. Race, release and consumer
 validation are tracked separately from these unit and stack integration tests.
+
+### Host interface contracts and build documentation
+
+The host stream interfaces now document partial successful reads/writes and the
+need to avoid donating descriptors twice when continuing a partial write. The
+ownership contract explicitly leaves an adopted descriptor with the caller on
+constructor failure. These statements were checked against
+`pkg/unet/unet_unsafe.go` and `unet.NewSocket`.
+
+The README and host-interface package comments distinguish Linux runtime
+support from non-Linux compilation scaffolding. They also identify the generated
+Go distribution required by external consumers, distinguish that tooling from
+an all-Go runtime implementation, and list the previously omitted fork PRs.
+These are documentation corrections; they do not add another host backend.

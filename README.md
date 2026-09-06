@@ -2,7 +2,7 @@
 
 # Kara
 
-**The sandbox kernel for [`oca`](https://github.com/0xCarbon/oca) — a [`gVisor`](https://github.com/google/gvisor) fork extended beyond Linux-only hosts.**
+**The sandbox kernel for [`oca`](https://github.com/0xCarbon/oca) — a [`gVisor`](https://github.com/google/gvisor) fork with runtime integrations and groundwork for future host ports.**
 
 *Kara — Tupi-Guarani for skin, bark, husk: the layer that wraps and protects what lives inside.*
 
@@ -25,9 +25,10 @@
 Kara is 0xCarbon's fork of [gVisor](https://github.com/google/gvisor), the
 user-space kernel that implements the Linux system surface and isolates
 workloads from the host. The fork's mission: serve as the **sandbox kernel
-for the [`oca`](https://github.com/0xCarbon/oca) agent runtime** — and keep
-being that kernel on **macOS and Windows**, not only Linux, by lifting the
-host-platform seam instead of forking the sentry with `#ifdef`s.
+for the [`oca`](https://github.com/0xCarbon/oca) agent runtime**. Running
+sandboxes currently requires **Linux**. Interfaces and compilation stubs prepare
+selected packages for future macOS and Windows backends; those backends and
+their isolation boundaries are not implemented.
 
 Upstream merges land regularly; the fork delta is kept minimal, reviewed, and
 rebasable (see [Fork delta](#fork-delta) and
@@ -47,12 +48,17 @@ rebasable (see [Fork delta](#fork-delta) and
 - **C/R contract hardening** &mdash; zombie-aware sandbox liveness, restore
   wedge regressions pinned by tests, held egress flows terminate at restore
   (never resume unclassified).
-- **Plain-Go `pkg/lisafs` + `pkg/flipcall`** &mdash; importable without bazel,
+- **Go module consumer support** &mdash; `pkg/lisafs`, `pkg/flipcall` and
+  `pkg/fdchannel` are importable from the generated Go source distribution,
   with the wire ABI frozen and machine-checked (third-party gofer
   enablement).
-- **Host-platform seam** *(in progress)* &mdash; Linux-only control plane made
-  optional behind capability probes so Hypervisor.framework and WHP backends
-  can land without sentry-wide conditionals.
+- **Library API** &mdash; `runsc/library` exposes typed lifecycle options,
+  checkpoint errors and compatibility keys to Go embedders.
+- **Host ingress** (`--ingress-fd`) &mdash; multiplexed TCP relaying into the
+  sandbox netstack over a donated Unix stream, with lifecycle and restore tests.
+- **Host interfaces** *(in progress)* &mdash; Linux adapters, non-Linux stubs
+  and selected Darwin compilation checks. Capability descriptions do not replace
+  kernel or permission checks, and LISAFS still uses its concrete Linux paths.
 
 ## Kara and oca
 
@@ -81,8 +87,16 @@ runsc --network=sandbox --overlay2=none --directfs=false \
   create -bundle /path/to/bundle --io-fds=3 --egress-fd=4 my-sandbox
 ```
 
-Plain-Go consumers of `pkg/lisafs` / `pkg/flipcall` need no bazel at all —
-see the packages' doc headers for the frozen ABI contract.
+Go module consumers use the generated `go` branch or the sources in Bazel's
+`//:gopath` archive. These distributions include the generated files needed by
+ordinary `go build`; a raw `master` checkout requires Bazel to generate them.
+The [external consumer check](pkg/lisafs/plain_go_import_test.sh) documents the
+archive layout and verifies the LISAFS, flipcall and fdchannel import surface.
+
+Here, Go module support describes the consumer's build tooling. The full runtime
+also includes architecture-specific assembly and native signal-handling code;
+it is not implemented entirely in Go. Compiling selected packages for Darwin
+does not provide a working Darwin sandbox runtime.
 
 For gVisor's full user, installation, and debugging documentation, see
 [`g3doc/`](g3doc/) (inherited from upstream).
@@ -95,10 +109,14 @@ For gVisor's full user, installation, and debugging documentation, see
 | `runsc/sandbox` | zombie-aware `IsRunning` (state settles after init death) | PR #2 |
 | netstack + runsc | external gofer `--io-fds`, gofer-monitor grace, egress flow gate `--egress-fd` (+ restore-survival, fail-closed config validation) | PR #3 |
 | `pkg/lisafs`, `pkg/flipcall` | plain-Go surface, frozen wire ABI + fuzz/golden conformance, host-primitive seam | PR #4 |
+| checkpoint/restore | cleanup, typed errors, compatibility keys and descriptor donation contracts | PR #5 |
+| host interfaces | Linux adapters, non-Linux stubs and compilation checks | PR #7 |
+| library + CI | typed runtime API, reference embedder and fork regression workflows | PR #8 |
+| upstream integration | updated runtime packaging and matching sidecar release builds | PR #9 |
+| ingress | donated-FD relay, half-closes, lifecycle and restore ownership | PR #10, #11 |
 
-Roadmap: checkpoint/restore contract API hardening, the full host-platform
-seam lift (macOS/Windows pre-work), and embeddable library mode + the oca
-managed-e2e suite as CI gates.
+The [fork review](g3doc/development/kara_fork_review.md) tracks ongoing runtime,
+interface, security, performance and developer-experience corrections.
 
 ## Upstream policy
 
