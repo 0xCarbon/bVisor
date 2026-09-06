@@ -142,6 +142,11 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	var cu cleanup.Cleanup
 	defer cu.Clean()
 
+	ingressFile := optionalFDFile(r.ingressFD)
+	if ingressFile != nil {
+		defer ingressFile.Close()
+	}
+
 	runArgs := container.Args{
 
 		ID:            id,
@@ -153,7 +158,6 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 		Attached:      !r.detach,
 		IOFDs:         r.ioFDs,
 		EgressFD:      optionalFD(r.egressFD),
-		IngressFD:     optionalFD(r.ingressFD),
 	}
 
 	log.Debugf("Restore container, cid: %s, rootDir: %q", id, conf.RootDir)
@@ -174,6 +178,16 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 		runArgs.Spec = r.spec
 		specutils.LogSpecDebug(runArgs.Spec, conf.OCISeccomp)
 
+		if ingressFile != nil {
+			// Create also needs the donation to keep aliases out of guest
+			// stdio. Restore borrows the original again for its fresh relay.
+			fd, err := unix.FcntlInt(ingressFile.Fd(), unix.F_DUPFD_CLOEXEC, 0)
+			if err != nil {
+				return util.Errorf("duplicating ingress file: %v", err)
+			}
+			runArgs.IngressFile = os.NewFile(uintptr(fd), "ingress-fd")
+		}
+
 		if c, err = container.New(conf, runArgs); err != nil {
 			return util.Errorf("creating container: %v", err)
 		}
@@ -188,7 +202,7 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	}
 
 	log.Debugf("Restore: %v", r.imagePath)
-	err = c.Restore(conf, r.imagePath, r.direct, r.background, nil /* networkArgs */)
+	err = c.RestoreWithOptions(conf, container.RestoreOptions{ImagePath: r.imagePath, Direct: r.direct, Background: r.background, IngressFile: ingressFile})
 	if err != nil {
 		return util.Errorf("starting container: %v", err)
 	}

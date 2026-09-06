@@ -560,10 +560,12 @@ type RestoreOpts struct {
 	// 2. optional checkpoint pages metadata file.
 	// 3. optional checkpoint pages file.
 	// 4. optional platform device file.
+	// 5. optional ingress relay socket.
 	urpc.FilePayload
-	HavePagesFile  bool
-	HaveDeviceFile bool
-	Background     bool
+	HavePagesFile   bool
+	HaveDeviceFile  bool
+	HaveIngressFile bool
+	Background      bool
 
 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
 	// domain socket connected to a URPC server implementing
@@ -600,6 +602,33 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	}
 	if len(o.Files) == 0 {
 		return fmt.Errorf("at least one file must be passed to Restore")
+	}
+	if o.HaveIngressFile {
+		minimum := 2 // state (or checkpoint gofer) and ingress
+		if o.HavePagesFile && !o.UseCheckpointGofer {
+			minimum += 2
+		}
+		if o.HaveDeviceFile {
+			minimum++
+		}
+		if len(o.Files) < minimum {
+			return fmt.Errorf("missing restore files for ingress donation")
+		}
+		f := o.Files[len(o.Files)-1]
+		o.Files = o.Files[:len(o.Files)-1]
+		fd := int(f.Fd())
+		if err := ValidateIngressFD(cm.l.root.conf, &fd); err != nil {
+			return err
+		}
+		relay, err := newIngressRelayFile(f, func() *kernel.Kernel { return cm.l.k })
+		if err != nil {
+			return err
+		}
+		// The loader is still created, so the old relay has no active dials.
+		if cm.l.ingressRelay != nil {
+			cm.l.ingressRelay.Close()
+		}
+		cm.l.ingressRelay = relay
 	}
 
 	stateFile, pagesMetadata, pagesFile, err := getRestoreReaders(o)

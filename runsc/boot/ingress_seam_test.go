@@ -15,7 +15,11 @@
 package boot
 
 import (
+	"errors"
+	"fmt"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 
 	"gvisor.dev/gvisor/runsc/config"
@@ -26,13 +30,16 @@ import (
 // relay has no sandbox netstack to serve, rather than being silently
 // accepted while the donating host waits forever.
 func TestIngressConfigRejections(t *testing.T) {
-	fd := 3
+	fd, zero, negative := 3, 0, -1
 	cases := []struct {
 		name string
 		conf *config.Config
 		fd   *int
 		want string
 	}{
+		{name: "none networking accepts descriptor zero", conf: &config.Config{Network: config.NetworkNone}, fd: &zero},
+		{name: "negative donated descriptor", conf: &config.Config{Network: config.NetworkSandbox}, fd: &negative, want: "invalid ingress FD"},
+		{name: "unknown network mode", conf: &config.Config{Network: config.NetworkType(99)}, fd: &fd, want: "requires network=sandbox"},
 		{
 			name: "host networking",
 			conf: &config.Config{Network: config.NetworkHost},
@@ -60,10 +67,10 @@ func TestIngressConfigRejections(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateIngressFD(tc.conf, tc.fd)
+			err := ValidateIngressFD(tc.conf, tc.fd)
 			if tc.want == "" {
 				if err != nil {
-					t.Fatalf("validateIngressFD(%s) = %v, want nil", tc.name, err)
+					t.Fatalf("ValidateIngressFD(%s) = %v, want nil", tc.name, err)
 				}
 				return
 			}
@@ -74,5 +81,44 @@ func TestIngressConfigRejections(t *testing.T) {
 				t.Fatalf("error = %q, want substring %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestIngressSocketValidation(t *testing.T) {
+	for _, kind := range []int{syscall.SOCK_STREAM, syscall.SOCK_DGRAM, syscall.SOCK_SEQPACKET} {
+		t.Run(fmt.Sprint(kind), func(t *testing.T) {
+			pair, err := syscall.Socketpair(syscall.AF_UNIX, kind, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			host := os.NewFile(uintptr(pair[0]), "host")
+			defer host.Close()
+			donated := os.NewFile(uintptr(pair[1]), "ingress")
+			relay, err := newIngressRelayFile(donated, nil)
+			if kind == syscall.SOCK_STREAM {
+				if err != nil {
+					t.Fatal(err)
+				}
+				relay.Close()
+			} else if err == nil {
+				relay.Close()
+				t.Fatal("accepted non-stream socket")
+			}
+			if _, err := donated.Stat(); !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("donation not consumed: %v", err)
+			}
+		})
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if relay, err := newIngressRelayFile(r, nil); err == nil {
+		relay.Close()
+		t.Fatal("accepted pipe as ingress transport")
+	}
+	if _, err := r.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("invalid donation not closed: %v", err)
 	}
 }

@@ -17,6 +17,7 @@ package library
 import (
 	"fmt"
 	"os"
+	"runtime"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
@@ -214,6 +215,14 @@ func (r *Runtime) Create(opts CreateOptions) (*Container, error) {
 		FSRestoreImagePath: opts.FSRestoreImagePath,
 		FSRestoreDirect:    opts.FSRestoreDirect,
 	}
+	ingressFile, err := duplicateFile(opts.IngressFile)
+	if err != nil {
+		return nil, fmt.Errorf("library: acquiring ingress file: %w", err)
+	}
+	if ingressFile != nil {
+		defer ingressFile.Close()
+		args.IngressFile = ingressFile
+	}
 	ioFDs, err := fileFDs(opts.GoferIOFiles)
 	if err != nil {
 		return nil, fmt.Errorf("library: acquiring gofer IO files: %w", err)
@@ -223,10 +232,6 @@ func (r *Runtime) Create(opts CreateOptions) (*Container, error) {
 		closeFDs(ioFDs)
 		return nil, fmt.Errorf("library: acquiring egress file: %w", err)
 	}
-	if args.IngressFD, err = fileFD(opts.IngressFile); err != nil {
-		closeFDs(filterNil(args.IngressFD, args.EgressFD, ioFDs))
-		return nil, fmt.Errorf("library: acquiring ingress file: %w", err)
-	}
 	if r.exePath != "" {
 		prev := specutils.ExePath
 		specutils.ExePath = r.exePath
@@ -234,8 +239,11 @@ func (r *Runtime) Create(opts CreateOptions) (*Container, error) {
 	}
 	c, err := container.New(r.conf, args)
 	if err != nil {
-		closeFDs(filterNil(args.IngressFD, args.EgressFD, ioFDs))
+		closeFDs(filterNil(args.EgressFD, ioFDs))
 		return nil, fmt.Errorf("library: creating container %q: %w", opts.ID, err)
+	}
+	if opts.IngressFile != nil {
+		opts.IngressFile.Close()
 	}
 	return &Container{rt: r, cont: c}, nil
 }
@@ -301,9 +309,12 @@ type RestoreOptions struct {
 	// unused.
 	GoferIOFiles []*os.File
 	EgressFile   *os.File
-	IngressFile  *os.File
 	PassFiles    map[int]*os.File
 	ExecFile     *os.File
+
+	// IngressFile replaces any create-time socket, including when ID already
+	// exists. Consumed only on success; retained by the caller on failure.
+	IngressFile *os.File
 
 	// ExpectedCompatKey, when non-empty, is a serialized compat.Key (e.g.
 	// the CheckpointResult.CompatKey.String() recorded when the image was
@@ -383,6 +394,14 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 		ExecFile:        opts.ExecFile,
 		FSRestoreDirect: opts.Direct,
 	}
+	ingressFile, err := duplicateFile(opts.IngressFile)
+	if err != nil {
+		return nil, fmt.Errorf("library: acquiring ingress file: %w", err)
+	}
+	if ingressFile != nil {
+		defer ingressFile.Close()
+		args.IngressFile = ingressFile
+	}
 	ioFDs, err := fileFDs(opts.GoferIOFiles)
 	if err != nil {
 		return nil, fmt.Errorf("library: acquiring gofer IO files: %w", err)
@@ -392,10 +411,6 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 		closeFDs(ioFDs)
 		return nil, fmt.Errorf("library: acquiring egress file: %w", err)
 	}
-	if args.IngressFD, err = fileFD(opts.IngressFile); err != nil {
-		closeFDs(filterNil(args.IngressFD, args.EgressFD, ioFDs))
-		return nil, fmt.Errorf("library: acquiring ingress file: %w", err)
-	}
 	if r.exePath != "" {
 		prev := specutils.ExePath
 		specutils.ExePath = r.exePath
@@ -403,7 +418,7 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 	}
 	c, err = container.New(r.conf, args)
 	if err != nil {
-		closeFDs(filterNil(args.IngressFD, args.EgressFD, ioFDs))
+		closeFDs(filterNil(args.EgressFD, ioFDs))
 		return nil, fmt.Errorf("library: creating container %q for restore: %w", opts.ID, err)
 	}
 	lc := &Container{rt: r, cont: c}
@@ -474,14 +489,25 @@ func closeFDs(fds []int) {
 
 // filterNil returns the FD list with the nilable donation pointers
 // flattened ahead of the gofer IO FDs.
-func filterNil(ingress, egress *int, ioFDs []int) []int {
-	all := make([]int, 0, len(ioFDs)+2)
-	if ingress != nil {
-		all = append(all, *ingress)
-	}
+func filterNil(egress *int, ioFDs []int) []int {
+	all := make([]int, 0, len(ioFDs)+1)
 	if egress != nil {
 		all = append(all, *egress)
 	}
 	all = append(all, ioFDs...)
 	return all
+}
+
+// duplicateFile borrows f and returns a separately owned donation. CLOEXEC keeps
+// the duplicate out of unrelated child processes created during container setup.
+func duplicateFile(f *os.File) (*os.File, error) {
+	if f == nil {
+		return nil, nil
+	}
+	fd, err := unix.FcntlInt(f.Fd(), unix.F_DUPFD_CLOEXEC, 0)
+	runtime.KeepAlive(f)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), "ingress-fd"), nil
 }

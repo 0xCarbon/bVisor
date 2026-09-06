@@ -16,6 +16,7 @@ go_library(
         "debug.go",
         "events.go",
         "fscheckpoint.go",
+        "ingress.go",
         "limits.go",
         "loader.go",
         "mount_hints.go",

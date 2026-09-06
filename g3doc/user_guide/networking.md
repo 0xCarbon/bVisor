@@ -164,3 +164,8 @@ Offload (GSO) to run with a kernel that is newer than 3.17. Add the
 [Production guide]: /docs/user_guide/production/
 [tbf-source]: https://cs.opensource.google/gvisor/gvisor/+/master:pkg/tcpip/link/qdisc/tbf/
 [tc-tbf]: https://www.man7.org/linux/man-pages/man8/tc-tbf.8.html
+
+## Host-owned listeners
+
+Kara supports [host ingress over a donated Unix socket](host_ingress.md) for
+host-accepted TCP connections into sandbox or loopback-only networking.

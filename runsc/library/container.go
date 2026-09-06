@@ -188,8 +188,11 @@ func (c *Container) Restore(opts RestoreOptions) error {
 			return err
 		}
 	}
-	if err := c.cont.Restore(c.rt.conf, opts.ImagePath, opts.Direct, opts.Background, nil /* networkArgs */); err != nil {
+	if err := c.cont.RestoreWithOptions(c.rt.conf, container.RestoreOptions{ImagePath: opts.ImagePath, Direct: opts.Direct, Background: opts.Background, IngressFile: opts.IngressFile}); err != nil {
 		return fmt.Errorf("library: restoring container %q from %q: %w", c.cont.ID, opts.ImagePath, err)
+	}
+	if opts.IngressFile != nil {
+		opts.IngressFile.Close()
 	}
 	return nil
 }
