@@ -128,6 +128,7 @@ go_library(
         "//pkg/state/statefile",
         "//pkg/sync",
         "//pkg/tcpip",
+        "//pkg/tcpip/adapters/gonet",
         "//pkg/tcpip/link/ethernet",
         "//pkg/tcpip/link/fdbased",
         "//pkg/tcpip/link/loopback",
@@ -149,6 +150,7 @@ go_library(
         "//pkg/urpc",
         "//pkg/usermem",
         "//runsc/boot/filter",
+        "//runsc/boot/ingress",
         "//runsc/boot/portforward",
         "//runsc/boot/pprof",
         "//runsc/boot/procfs",
@@ -209,5 +211,15 @@ go_test(
         "//pkg/tcpip/stack",
         "//runsc/config",
         "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
+    name = "ingress_seam_test",
+    size = "small",
+    srcs = ["ingress_seam_test.go"],
+    library = ":boot",
+    deps = [
+        "//runsc/config",
     ],
 )

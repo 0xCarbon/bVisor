@@ -85,6 +85,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/runsc/boot/filter"
+	"gvisor.dev/gvisor/runsc/boot/ingress"
 	pf "gvisor.dev/gvisor/runsc/boot/portforward"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
 	"gvisor.dev/gvisor/runsc/config"
@@ -223,6 +224,14 @@ type Loader struct {
 	// --egress-fd during New. Restore re-injects it into the loaded kernel
 	// via stack.CtxEgressGate so the gate survives checkpoint/restore.
 	egressGate *egressGateClient
+
+	// ingressRelay is the host-ingress relay built from the donated
+	// --ingress-fd during New. Serving starts when the kernel runs (run),
+	// so a restored kernel dials through the loaded netstack rather than
+	// the pre-restore empty one. The relay ends when the host closes the
+	// conn (checkpoint/stop teardown); restore re-donates a fresh FD
+	// (Oca #541).
+	ingressRelay *ingress.Relay
 
 	// ctrl is the control server.
 	ctrl *controller
@@ -434,6 +443,11 @@ type Args struct {
 	// pointer disables the data path; an explicit descriptor 0 remains valid.
 	// The Loader takes ownership (Oca #447).
 	EgressFD *int
+	// IngressFD is the optional AF_UNIX FD to the Oca host-ingress relay. A
+	// nil pointer disables the data path; an explicit descriptor 0 remains
+	// valid. The Loader takes ownership and serves the relay against the
+	// sandbox netstack once the root namespace is final (Oca #541).
+	IngressFD *int
 	// GoferFilestoreFDs are FDs to the regular files that will back the tmpfs or
 	// overlayfs mount for certain gofer mounts.
 	GoferFilestoreFDs []int
@@ -755,6 +769,12 @@ func New(args Args) (*Loader, error) {
 	if creds == nil {
 		return nil, fmt.Errorf("getting root credentials")
 	}
+	// The ingress relay must fail closed: reject any configuration with no
+	// sandbox netstack to serve, instead of hanging the donating host
+	// (Oca #541).
+	if err := validateIngressFD(args.Conf, args.IngressFD); err != nil {
+		return nil, err
+	}
 	// Create root network namespace/stack.
 	netns, creator, err := newRootNetworkNamespace(args.Conf, tk, creds.UserNamespace, l.k, args.EgressFD)
 	if err != nil {
@@ -762,6 +782,16 @@ func New(args Args) (*Loader, error) {
 	}
 	if creator != nil {
 		l.egressGate = creator.egressGate
+	}
+	// Consume the donated ingress FD, if any (Oca #541). Serving starts in
+	// run(), once the root namespace is final: configured at boot, or
+	// loaded from the checkpoint at restore.
+	if args.IngressFD != nil {
+		relay, err := newIngressRelay(*args.IngressFD, l.k)
+		if err != nil {
+			return nil, fmt.Errorf("oca ingress relay: %w", err)
+		}
+		l.ingressRelay = relay
 	}
 	args.StartupTimer.Reached("network stack created")
 
@@ -1315,6 +1345,18 @@ func (l *Loader) run() error {
 		}
 	})
 	l.startupTimer.Reached("signal forwarding started")
+
+	// Oca host-ingress relay (#541): the root namespace is final here, so
+	// serve the donated FD against it. The relay lives until the host
+	// closes the conn (checkpoint/stop teardown; restore re-donates a
+	// fresh FD alongside the fresh gofer/egress FDs).
+	if l.ingressRelay != nil {
+		go func() {
+			if err := l.ingressRelay.Serve(); err != nil {
+				log.Warningf("oca ingress relay: %v", err)
+			}
+		}()
+	}
 
 	log.Infof("Process should have started...")
 	l.watchdog.Start()
